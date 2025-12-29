@@ -68,29 +68,67 @@ Administrator privileges are required because the toolkit manages users, service
 Use PowerShell to move into the folder where the script is located.
 
 Example:
-```powershell
+in powershell
 cd D:\Path\To\serveradmin-toolkit
 
 ---
 
 ## Screenshots
 
-Example screenshots taken from a Windows Server 2022 lab environment.
+Below are example screenshots showing the toolkit in use on Windows Server 2022.
+These images demonstrate the menu-driven interface and some typical outputs produced by the tool.
 
-### Main Menu
+Screenshots are taken from a lab environment.
+
+---
+
+### Main Menu (Toolkit Start)
+
+The main menu provides quick access to all administrative areas such as users, networking, security, services, Active Directory, DNS, DHCP, and logging.
+
 ![Main Menu](docs/screenshots/main-menu.png)
 
-### Network Overview
+---
+
+### System and Network Overview
+
+This view shows basic system and network information, including IP configuration and active connections.
+It provides a fast way to understand the current server state without opening multiple tools.
+
 ![Network Overview](docs/screenshots/network-overview.png)
 
+---
+
 ### Services Management
+
+The services menu allows administrators to list services, search by name, and safely stop or disable unwanted services.
+Status and start mode are clearly displayed.
+
 ![Services Management](docs/screenshots/services.png)
 
-### Firewall and Zero Trust
-![Firewall](docs/screenshots/firewall.png)
+---
 
-### Active Directory
+### Firewall and Zero Trust Mode
+
+This screenshot shows firewall management options, including enabling and disabling rules and applying a Zero Trust baseline.
+All destructive actions require confirmation.
+
+![Firewall Management](docs/screenshots/firewall.png)
+
+---
+
+### Active Directory Management
+
+Active Directory features include user and computer management, OU operations, and account status changes.
+This menu is only available when the required modules are installed.
+
 ![Active Directory](docs/screenshots/active-directory.png)
 
-### Logs
+---
+
+### Logging and Reports
+
+Each run of the toolkit generates timestamped logs.
+These logs can be used for auditing, troubleshooting, or documentation.
+
 ![Logs](docs/screenshots/logs.png)
