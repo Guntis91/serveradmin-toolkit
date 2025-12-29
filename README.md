@@ -53,9 +53,20 @@ The toolkit provides fast access to common administrative tasks without manually
 
 ## How to Run
 
-1. Open **PowerShell as Administrator**
-2. Navigate to the project folder:
-   ```powershell
-   cd D:\Github\serveradmin-toolkit
+Follow these steps to run the toolkit safely and correctly.
 
+### Step 1  Open PowerShell as Administrator
+- Click Start
+- Search for PowerShell
+- Right-click and select Run as Administrator
 
+Administrator privileges are required because the toolkit manages users, services, firewall rules, and system settings.
+
+---
+
+### Step 2  Navigate to the project folder
+Use PowerShell to move into the folder where the script is located.
+
+Example:
+```powershell
+cd D:\Path\To\serveradmin-toolkit
