@@ -68,9 +68,9 @@ Administrator privileges are required because the toolkit manages users, service
 Use PowerShell to move into the folder where the script is located.
 
 Example:
-in powershell
+```powershell
 cd D:\Path\To\serveradmin-toolkit
-
+```
 ---
 
 ## Screenshots
