@@ -1,0 +1,2518 @@
+<#
+================================================================================
+ServerAdmin-Toolkit.ps1  (Windows Server 2022)
+================================================================================
+A “one tool” PowerShell admin toolkit with:
+- Clear top-level menus (easy to find actions fast)
+- Strong input validation (no red errors for simple mistakes)
+- Friendly error messages (tells you what was wrong and how to fix it)
+- Real output displayed (no silent “does nothing” problem)
+- Logs saved to disk + full transcript of the session
+
+How to run:
+1) Run PowerShell as Administrator
+2) On Desktop, create the file:
+   notepad .\ServerAdmin-Toolkit.ps1
+3) Paste this script and save
+4) Run:
+   Set-ExecutionPolicy -Scope Process Bypass -Force
+   .\ServerAdmin-Toolkit.ps1
+
+Notes:
+- AD / DNS / DHCP / GPO features require those roles/tools installed.
+- If modules are missing, the script will clearly explain what is missing.
+- Zero Trust can break RDP/DNS/DHCP/AD. Use VM console access.
+
+Logs:
+- All logs and exports go to:
+  C:\AdminToolkit\Logs\<timestamp>\
+- Transcript automatically records everything printed.
+
+================================================================================
+#>
+
+# ==============================================================================
+# GLOBAL SETTINGS (simple values you can change later)
+# ==============================================================================
+
+# This is the title shown at the top of the program.
+$Global:ToolkitName = "ServerAdmin Toolkit (WS2022)"
+
+# This is where all logs will be stored on disk.
+$Global:LogRoot = "C:\AdminToolkit\Logs"
+
+# This timestamp is used for this run.
+$Global:DateTag = (Get-Date -Format "yyyy-MM-dd_HH-mm-ss")
+
+# This is the folder for this session’s logs.
+$Global:SessionLogDir = Join-Path $Global:LogRoot $Global:DateTag
+
+# This controls whether a transcript is started.
+$Global:TranscriptOn = $true
+
+# These firewall rule groups make it easy to find rules created by THIS toolkit.
+$Global:FirewallGroup_AllowList = "ATK AllowList Rules"
+$Global:FirewallGroup_Blocks    = "ATK Block Rules"
+
+# ==============================================================================
+# OUTPUT HELPERS (consistent UI look)
+# ==============================================================================
+
+function Write-Info {
+    param([Parameter(Mandatory=$true)][string]$Message)
+    # This prints informational text in cyan so it stands out.
+    Write-Host $Message -ForegroundColor Cyan
+}
+
+function Write-Good {
+    param([Parameter(Mandatory=$true)][string]$Message)
+    # This prints success text in green.
+    Write-Host $Message -ForegroundColor Green
+}
+
+function Write-Warn {
+    param([Parameter(Mandatory=$true)][string]$Message)
+    # This prints warnings and user errors in yellow.
+    Write-Host $Message -ForegroundColor Yellow
+}
+
+function Write-Section {
+    param([Parameter(Mandatory=$true)][string]$Title)
+    # This prints a consistent section header.
+    Write-Host ""
+    Write-Host "==============================" -ForegroundColor DarkGray
+    Write-Host $Title -ForegroundColor Cyan
+    Write-Host "==============================" -ForegroundColor DarkGray
+}
+
+function Pause-PressEnter {
+    # This pauses so the user can read output before returning to menu.
+    Write-Host ""
+    [void](Read-Host "Press ENTER to continue")
+}
+
+function Read-Choice {
+    param([Parameter(Mandatory=$true)][string]$Prompt)
+    # This reads input and trims spaces (so " 1 " becomes "1").
+    return (Read-Host $Prompt).Trim()
+}
+
+function Confirm-YesNo {
+    param([Parameter(Mandatory=$true)][string]$Message)
+    # This asks a standard Y/N question.
+    $ans = (Read-Host "$Message (Y/N)").Trim().ToUpper()
+    return ($ans -eq "Y" -or $ans -eq "YES")
+}
+
+function Show-UserError {
+    param([Parameter(Mandatory=$true)][string]$Message)
+    # This prints a friendly error message (instead of a red exception stack trace).
+    Write-Warn "ERROR: $Message"
+}
+
+# ==============================================================================
+# SAFE EXECUTION HELPER (THIS IS THE KEY FIX FOR “NOTHING PRINTS”)
+# ==============================================================================
+
+function Invoke-Safe {
+    <#
+    Runs a command block safely and ALWAYS shows its output.
+
+    Why this exists:
+    - In many scripts, output gets hidden by accidental piping to Out-Null.
+    - This function captures what the block outputs and prints it using Out-Host.
+
+    Returns:
+    - $true on success
+    - $false on failure (and prints a friendly error message)
+    #>
+    param(
+        [Parameter(Mandatory=$true)][ScriptBlock]$Action,
+        [Parameter(Mandatory=$true)][string]$FriendlyError
+    )
+
+    try {
+        # This runs the action and captures anything it outputs.
+        $output = & $Action
+
+        # This prints output to screen in a way that won’t be suppressed.
+        if ($null -ne $output) {
+            $output | Out-Host
+        }
+
+        # This indicates success to the calling code.
+        return $true
+    }
+    catch {
+        # This reads the real error message and prints it in a friendly way.
+        $details = $_.Exception.Message
+        Show-UserError "$FriendlyError  Details: $details"
+        return $false
+    }
+}
+
+function Save-OutputToFile {
+    <#
+    Saves output from a command into a text file inside the session log folder.
+
+    Steps:
+    - Build a file path in the session log folder
+    - Run the command
+    - Convert its output to a string
+    - Save it to disk
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$FileName,
+        [Parameter(Mandatory=$true)][ScriptBlock]$Command
+    )
+
+    # This creates the full file path.
+    $path = Join-Path $Global:SessionLogDir $FileName
+
+    # This safely runs the command and saves to file.
+    $ok = Invoke-Safe -FriendlyError "Could not save output to file '$path'." -Action {
+        & $Command | Out-String | Set-Content -Path $path -Encoding UTF8
+    }
+
+    # This prints success only if the file exists.
+    if ($ok -and (Test-Path $path)) {
+        Write-Good "Saved: $path"
+    } elseif ($ok) {
+        Show-UserError "Save command completed, but file was not found. Check folder permissions."
+    }
+}
+
+# ==============================================================================
+# STARTUP CHECKS (admin + log folders + transcript)
+# ==============================================================================
+
+function Ensure-Admin {
+    # This checks if PowerShell is running as Administrator.
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host ""
+        Write-Host "This script must be run as Administrator." -ForegroundColor Red
+        Write-Host "Right-click PowerShell -> Run as Administrator." -ForegroundColor Yellow
+        exit 1
+    }
+}
+
+function Ensure-LogFolders {
+    # This creates the log folders if they don’t exist.
+    if (-not (Test-Path $Global:LogRoot)) {
+        New-Item -ItemType Directory -Path $Global:LogRoot -Force | Out-Null
+    }
+    if (-not (Test-Path $Global:SessionLogDir)) {
+        New-Item -ItemType Directory -Path $Global:SessionLogDir -Force | Out-Null
+    }
+}
+
+function Start-ToolkitTranscript {
+    # This starts the transcript (records the session into a file).
+    if (-not $Global:TranscriptOn) { return }
+
+    $tpath = Join-Path $Global:SessionLogDir "Transcript_$($Global:DateTag).txt"
+
+    # Start-Transcript can fail if one is already running, so we handle it safely.
+    $null = Invoke-Safe -FriendlyError "Could not start transcript." -Action {
+        Start-Transcript -Path $tpath -Force | Out-Null
+    }
+}
+
+function Stop-ToolkitTranscript {
+    # This stops the transcript cleanly.
+    if (-not $Global:TranscriptOn) { return }
+
+    $null = Invoke-Safe -FriendlyError "Could not stop transcript." -Action {
+        Stop-Transcript | Out-Null
+    }
+}
+
+function Test-IsDomainController {
+    # This checks if the machine is a Domain Controller based on DomainRole.
+    $role = $null
+    $ok = Invoke-Safe -FriendlyError "Could not detect Domain Controller state." -Action {
+        $role = (Get-CimInstance Win32_ComputerSystem).DomainRole
+    }
+    if (-not $ok) { return $false }
+    return ($role -eq 4 -or $role -eq 5)
+}
+
+# ==============================================================================
+# MODULE LOADING HELPERS (AD, GPO, DNS, DHCP)
+# ==============================================================================
+
+function Try-ImportModule {
+    param([Parameter(Mandatory=$true)][string]$ModuleName)
+
+    # This checks if the module exists on the system.
+    if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+        return $false
+    }
+
+    # This imports the module safely.
+    return (Invoke-Safe -FriendlyError "Failed to import module '$ModuleName'." -Action {
+        Import-Module $ModuleName -ErrorAction Stop
+    })
+}
+
+function AD-EnsureModule {
+    if (Try-ImportModule "ActiveDirectory") { return $true }
+    Show-UserError "ActiveDirectory module not found. Install AD tools/RSAT or run on a DC."
+    return $false
+}
+
+function GPO-EnsureModule {
+    if (Try-ImportModule "GroupPolicy") { return $true }
+    Show-UserError "GroupPolicy module not found. Install GPMC / RSAT Group Policy tools."
+    return $false
+}
+
+function DNS-EnsureModule {
+    if (Try-ImportModule "DnsServer") { return $true }
+    Show-UserError "DnsServer module not found. Install DNS role or RSAT DNS tools."
+    return $false
+}
+
+function DHCP-EnsureModule {
+    if (Try-ImportModule "DhcpServer") { return $true }
+    Show-UserError "DhcpServer module not found. Install DHCP role or RSAT DHCP tools."
+    return $false
+}
+
+# ==============================================================================
+# INPUT VALIDATION HELPERS (prevents red errors)
+# ==============================================================================
+
+function Require-NonEmpty {
+    param([string]$Value,[string]$FieldName)
+    # This ensures required inputs are not empty.
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        Show-UserError "$FieldName cannot be blank."
+        return $false
+    }
+    return $true
+}
+
+function Test-Port {
+    param([string]$PortText)
+    # This validates a TCP/UDP port number.
+    if ($PortText -notmatch '^\d+$') { return $false }
+    $p = [int]$PortText
+    return ($p -ge 1 -and $p -le 65535)
+}
+
+function Test-IPv4 {
+    param([string]$IpText)
+    # This validates a basic IPv4 format and ranges.
+    $ip = $IpText.Trim()
+    if ($ip -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { return $false }
+    $parts = $ip.Split('.')
+    foreach ($x in $parts) {
+        if ([int]$x -lt 0 -or [int]$x -gt 255) { return $false }
+    }
+    return $true
+}
+
+function Convert-DnsNameToDN {
+    param([string]$DnsName)
+    # This converts "contoso.local" to "DC=contoso,DC=local".
+    $parts = $DnsName.Split(".") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($parts.Count -lt 2) { return $null }
+    return ($parts | ForEach-Object { "DC=$_" }) -join ","
+}
+
+function Test-DistinguishedNameLike {
+    param([string]$Text)
+    # This is a loose DN check (must include DC= and commas).
+    return ($Text -match '(^|,)\s*DC=' -and $Text -match ',')
+}
+
+function Resolve-GPTargetToDN {
+    <#
+    Accepts:
+    - OU DN: OU=Workstations,DC=contoso,DC=local
+    - Domain DN: DC=contoso,DC=local
+    - DNS name: contoso.local => converted to DC=...
+    Rejects:
+    - random strings like "local"
+    #>
+    param([string]$InputText)
+
+    $t = $InputText.Trim()
+
+    if (Test-DistinguishedNameLike $t) { return $t }
+
+    if ($t -match '^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$') {
+        return (Convert-DnsNameToDN -DnsName $t)
+    }
+
+    return $null
+}
+
+function Get-PrimaryIPv4Info {
+    # This tries to find a usable IPv4 and suggests a subnet for allow-listing.
+    $result = $null
+    $ok = Invoke-Safe -FriendlyError "Could not read network IP information." -Action {
+        $ip = Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object {
+                $_.IPAddress -notlike "169.254.*" -and
+                $_.IPAddress -ne "127.0.0.1" -and
+                $_.PrefixLength -gt 0
+            } |
+            Sort-Object PrefixLength -Descending |
+            Select-Object -First 1
+
+        if ($ip) {
+            $oct = $ip.IPAddress.Split(".")
+            $suggest = "$($ip.IPAddress)/$($ip.PrefixLength)"
+            if ($ip.PrefixLength -eq 24 -and $oct.Count -eq 4) {
+                $suggest = "$($oct[0]).$($oct[1]).$($oct[2]).0/24"
+            }
+            $result = [pscustomobject]@{
+                IPAddress     = $ip.IPAddress
+                PrefixLength  = $ip.PrefixLength
+                SuggestedCIDR = $suggest
+            }
+        }
+    }
+    if (-not $ok) { return $null }
+    return $result
+}
+
+# ==============================================================================
+# NETWORK MENU
+# ==============================================================================
+
+function Net-ShowIPInfo {
+    Write-Section "IP Configuration"
+    $null = Invoke-Safe -FriendlyError "Could not read IP configuration." -Action {
+        Get-NetIPConfiguration | Format-List
+    }
+}
+
+function Net-ActiveConnections {
+    Write-Section "Active TCP Connections (Top 150)"
+    $null = Invoke-Safe -FriendlyError "Could not list TCP connections." -Action {
+        Get-NetTCPConnection | Sort-Object State | Select-Object -First 150 | Format-Table -AutoSize
+    }
+}
+
+function Net-ListeningPortsWithProcess {
+    Write-Section "Listening TCP Ports + Process"
+    $null = Invoke-Safe -FriendlyError "Could not list listening ports." -Action {
+        $list = Get-NetTCPConnection -State Listen | Sort-Object LocalPort
+        $rows = foreach ($c in $list) {
+            $procName = "Unknown"
+            try { $procName = (Get-Process -Id $c.OwningProcess -ErrorAction Stop).ProcessName } catch {}
+            [pscustomobject]@{
+                LocalAddress = $c.LocalAddress
+                LocalPort    = $c.LocalPort
+                PID          = $c.OwningProcess
+                ProcessName  = $procName
+            }
+        }
+        $rows | Format-Table -AutoSize
+    }
+}
+
+function Net-TrafficSnapshot {
+    Write-Section "Traffic Snapshot (Basic Counters)"
+    $null = Invoke-Safe -FriendlyError "Could not read performance counters (may be disabled)." -Action {
+        $paths = @(
+            "\Network Interface(*)\Bytes Total/sec",
+            "\TCPv4\Connections Active",
+            "\TCPv4\Segments/sec",
+            "\IPv4\Datagrams/sec"
+        )
+        Get-Counter -Counter $paths -SampleInterval 1 -MaxSamples 3 |
+            Select-Object -ExpandProperty CounterSamples |
+            Select-Object Path,CookedValue |
+            Format-Table -AutoSize
+    }
+}
+
+function Net-SaveSnapshotToLog {
+    Write-Section "Save Network Snapshot"
+    Save-OutputToFile -FileName "Net_IPConfig.txt"       -Command { Get-NetIPConfiguration }
+    Save-OutputToFile -FileName "Net_TCPConnections.txt" -Command { Get-NetTCPConnection }
+    Save-OutputToFile -FileName "Net_ListeningPorts.txt" -Command { Get-NetTCPConnection -State Listen | Sort-Object LocalPort }
+}
+
+function Network-Menu {
+    while ($true) {
+        Write-Section "Network"
+        Write-Host "1  Show IP config"
+        Write-Host "2  Show active TCP connections"
+        Write-Host "3  Show listening ports + process"
+        Write-Host "4  Traffic snapshot counters"
+        Write-Host "5  Save network snapshot to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { Net-ShowIPInfo; Pause-PressEnter }
+            "2" { Net-ActiveConnections; Pause-PressEnter }
+            "3" { Net-ListeningPortsWithProcess; Pause-PressEnter }
+            "4" { Net-TrafficSnapshot; Pause-PressEnter }
+            "5" { Net-SaveSnapshotToLog; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice. Pick a number from the menu."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# LOCAL USERS MENU
+# ==============================================================================
+
+function LocalUsers-List {
+    Write-Section "Local Users"
+    $null = Invoke-Safe -FriendlyError "Could not list local users." -Action {
+        Get-LocalUser | Select-Object Name,Enabled,LastLogon,Description | Format-Table -AutoSize
+    }
+}
+
+function LocalUsers-Add {
+    Write-Section "Add Local User"
+
+    if (Test-IsDomainController) {
+        Write-Warn "This server appears to be a Domain Controller."
+        Write-Warn "On a DC, you normally manage users in Active Directory (use AD Users menu)."
+        if (-not (Confirm-YesNo "Do you STILL want to try to create a LOCAL user?")) { return }
+    }
+
+    $username = Read-Choice "Enter username"
+    if (-not (Require-NonEmpty $username "Username")) { return }
+
+    # Check if the user already exists so we don’t throw errors.
+    $exists = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+    if ($exists) {
+        Show-UserError "Local user '$username' already exists."
+        return
+    }
+
+    $pwd  = Read-Host "Enter password (hidden)" -AsSecureString
+    $full = Read-Choice "Full name (optional)"
+    $desc = Read-Choice "Description (optional)"
+
+    # Create user and stop if password policy rejects it.
+    $ok = Invoke-Safe -FriendlyError "User was NOT created. Password likely failed policy (length/complexity/history)." -Action {
+        New-LocalUser -Name $username -Password $pwd -FullName $full -Description $desc -ErrorAction Stop | Out-Null
+    }
+    if (-not $ok) { return }
+
+    # Verify user exists before saying success.
+    $created = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+    if (-not $created) {
+        Show-UserError "Create command ran but user '$username' was not found afterwards."
+        return
+    }
+
+    Write-Good "Created local user: $username"
+
+    if (Confirm-YesNo "Add $username to local Administrators?") {
+        $ok2 = Invoke-Safe -FriendlyError "Could not add user to Administrators group." -Action {
+            Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction Stop
+        }
+        if (-not $ok2) { return }
+
+        # Verify membership (best-effort).
+        $members = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue
+        if ($members -and ($members.Name -match "\\$username$")) {
+            Write-Good "Added to Administrators."
+        } else {
+            Write-Warn "Command completed, but membership verification was not conclusive."
+        }
+    }
+}
+
+function LocalUsers-Remove {
+    Write-Section "Remove Local User"
+    $username = Read-Choice "Enter username to remove"
+    if (-not (Require-NonEmpty $username "Username")) { return }
+
+    $u = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+    if (-not $u) {
+        Show-UserError "Local user '$username' does not exist."
+        return
+    }
+
+    if (-not (Confirm-YesNo "DELETE local user '$username'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to remove local user." -Action {
+        Remove-LocalUser -Name $username -ErrorAction Stop
+    }
+    if (-not $ok) { return }
+
+    $still = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+    if ($still) {
+        Show-UserError "Remove command ran, but user '$username' still exists."
+        return
+    }
+
+    Write-Good "Removed local user: $username"
+}
+
+function LocalUsers-PasswordPolicyView {
+    Write-Section "Local Password Policy (View)"
+    Write-Host "This reads local policy using 'net accounts'." -ForegroundColor DarkGray
+    $null = Invoke-Safe -FriendlyError "Could not read local password policy." -Action {
+        net accounts
+    }
+}
+
+function LocalUsers-PasswordPolicySet {
+    Write-Section "Local Password Policy (Set)"
+    Write-Warn "This changes LOCAL password policy using 'net accounts'."
+    Write-Warn "On a Domain Controller, you normally use Domain policy (AD Policies menu)."
+    if (-not (Confirm-YesNo "Continue?")) { return }
+
+    $minLen = Read-Choice "Min password length (blank = skip)"
+    $maxAge = Read-Choice "Max password age in days (blank = skip)"
+    $minAge = Read-Choice "Min password age in days (blank = skip)"
+    $hist   = Read-Choice "Password history length (blank = skip)"
+    $lockTh = Read-Choice "Lockout threshold (blank = skip)"
+
+    $args = @()
+
+    if ($minLen) { if ($minLen -notmatch '^\d+$') { Show-UserError "Min length must be a number."; return }; $args += "/minpwlen:$minLen" }
+    if ($maxAge) { if ($maxAge -notmatch '^\d+$') { Show-UserError "Max age must be a number."; return }; $args += "/maxpwage:$maxAge" }
+    if ($minAge) { if ($minAge -notmatch '^\d+$') { Show-UserError "Min age must be a number."; return }; $args += "/minpwage:$minAge" }
+    if ($hist)   { if ($hist   -notmatch '^\d+$') { Show-UserError "History must be a number."; return }; $args += "/uniquepw:$hist" }
+    if ($lockTh) { if ($lockTh -notmatch '^\d+$') { Show-UserError "Lockout threshold must be a number."; return }; $args += "/lockoutthreshold:$lockTh" }
+
+    if ($args.Count -eq 0) {
+        Show-UserError "No changes entered."
+        return
+    }
+
+    Write-Info "About to apply: net accounts $($args -join ' ')"
+    if (-not (Confirm-YesNo "Apply these local policy settings now?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to apply local policy settings." -Action {
+        net accounts $args
+    }
+    if ($ok) {
+        Write-Good "Local policy command completed. New settings:"
+        LocalUsers-PasswordPolicyView
+    }
+}
+
+function LocalUsers-Menu {
+    while ($true) {
+        Write-Section "Local Users"
+        Write-Host "1  List local users"
+        Write-Host "2  Add local user"
+        Write-Host "3  Remove local user"
+        Write-Host "4  View local password policy"
+        Write-Host "5  Set local password policy (careful)"
+        Write-Host "6  Save local user list to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { LocalUsers-List; Pause-PressEnter }
+            "2" { LocalUsers-Add; Pause-PressEnter }
+            "3" { LocalUsers-Remove; Pause-PressEnter }
+            "4" { LocalUsers-PasswordPolicyView; Pause-PressEnter }
+            "5" { LocalUsers-PasswordPolicySet; Pause-PressEnter }
+            "6" { Save-OutputToFile -FileName "LocalUsers_List.txt" -Command { Get-LocalUser | Select-Object Name,Enabled,LastLogon,Description }; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# AD USERS MENU
+# ==============================================================================
+
+function ADU-ListUsers {
+    Write-Section "AD Users (Top 200)"
+    if (-not (AD-EnsureModule)) { return }
+    $null = Invoke-Safe -FriendlyError "Could not list AD users." -Action {
+        Get-ADUser -Filter * -ResultSetSize 200 -Properties Enabled,LockedOut,LastLogonDate |
+            Select-Object SamAccountName,Name,Enabled,LockedOut,LastLogonDate |
+            Format-Table -AutoSize
+    }
+}
+
+function ADU-FindUser {
+    Write-Section "Find AD User"
+    if (-not (AD-EnsureModule)) { return }
+
+    $q = Read-Choice "Enter samAccountName OR name text"
+    if (-not (Require-NonEmpty $q "Search text")) { return }
+
+    $null = Invoke-Safe -FriendlyError "Could not search AD users." -Action {
+        $u = Get-ADUser -Identity $q -ErrorAction SilentlyContinue
+        if ($u) {
+            Get-ADUser -Identity $q -Properties * |
+                Select-Object SamAccountName,Name,Enabled,LockedOut,LastLogonDate,PasswordLastSet,EmailAddress,DistinguishedName |
+                Format-List
+        } else {
+            $matches = Get-ADUser -Filter "Name -like '*$q*'" -Properties Enabled,LockedOut,LastLogonDate
+            if (-not $matches) {
+                Write-Warn "No users found matching '$q'."
+            } else {
+                $matches | Select-Object SamAccountName,Name,Enabled,LockedOut,LastLogonDate | Format-Table -AutoSize
+            }
+        }
+    }
+}
+
+function ADU-CreateUser {
+    Write-Section "Create AD User"
+    if (-not (AD-EnsureModule)) { return }
+
+    $sam  = Read-Choice "samAccountName (username)"
+    if (-not (Require-NonEmpty $sam "samAccountName")) { return }
+
+    $name = Read-Choice "Full name (example: John Smith)"
+    if (-not (Require-NonEmpty $name "Full name")) { return }
+
+    $existing = Get-ADUser -Identity $sam -ErrorAction SilentlyContinue
+    if ($existing) {
+        Show-UserError "AD user '$sam' already exists."
+        return
+    }
+
+    $upnDomain = Read-Choice "UPN domain (blank = auto from domain)"
+    if ([string]::IsNullOrWhiteSpace($upnDomain)) {
+        $upnDomain = $null
+        $null = Invoke-Safe -FriendlyError "Could not read domain DNSRoot." -Action {
+            $upnDomain = (Get-ADDomain).DNSRoot
+        }
+    }
+
+    if (-not $upnDomain) {
+        Show-UserError "Could not determine UPN domain. Enter it manually (example: contoso.local)."
+        return
+    }
+
+    $upn = "$sam@$upnDomain"
+    $pwd = Read-Host "Enter temporary password (hidden)" -AsSecureString
+    $ou  = Read-Choice "OU DN (blank = default Users container)"
+
+    $ok = Invoke-Safe -FriendlyError "Failed to create AD user. Check password policy and OU DN." -Action {
+        if ([string]::IsNullOrWhiteSpace($ou)) {
+            New-ADUser -SamAccountName $sam -Name $name -UserPrincipalName $upn `
+                -AccountPassword $pwd -Enabled $true -ChangePasswordAtLogon $true -ErrorAction Stop
+        } else {
+            if (-not (Test-DistinguishedNameLike $ou)) {
+                throw "OU DN looks invalid. Example: OU=Users,DC=contoso,DC=local"
+            }
+            New-ADUser -SamAccountName $sam -Name $name -UserPrincipalName $upn `
+                -AccountPassword $pwd -Enabled $true -ChangePasswordAtLogon $true -Path $ou -ErrorAction Stop
+        }
+    }
+    if (-not $ok) { return }
+
+    $created = Get-ADUser -Identity $sam -ErrorAction SilentlyContinue
+    if (-not $created) {
+        Show-UserError "Create command ran but user '$sam' was not found afterwards."
+        return
+    }
+
+    Write-Good "Created AD user: $sam (UPN: $upn)"
+}
+
+function ADU-RemoveUser {
+    Write-Section "Remove AD User"
+    if (-not (AD-EnsureModule)) { return }
+
+    $sam = Read-Choice "Enter samAccountName to delete"
+    if (-not (Require-NonEmpty $sam "samAccountName")) { return }
+
+    $u = Get-ADUser -Identity $sam -ErrorAction SilentlyContinue
+    if (-not $u) { Show-UserError "User '$sam' not found."; return }
+
+    if (-not (Confirm-YesNo "DELETE AD user '$sam'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to delete AD user." -Action {
+        Remove-ADUser -Identity $sam -Confirm:$false -ErrorAction Stop
+    }
+    if (-not $ok) { return }
+
+    $still = Get-ADUser -Identity $sam -ErrorAction SilentlyContinue
+    if ($still) { Show-UserError "Delete command ran but user still exists."; return }
+
+    Write-Good "Deleted AD user: $sam"
+}
+
+function ADU-EnableDisableUser {
+    Write-Section "Enable / Disable AD User"
+    if (-not (AD-EnsureModule)) { return }
+
+    $sam = Read-Choice "Enter samAccountName"
+    if (-not (Require-NonEmpty $sam "samAccountName")) { return }
+
+    $u = Get-ADUser -Identity $sam -Properties Enabled -ErrorAction SilentlyContinue
+    if (-not $u) { Show-UserError "User '$sam' not found."; return }
+
+    Write-Info "Current Enabled = $($u.Enabled)"
+    if ($u.Enabled) {
+        if (Confirm-YesNo "Disable user '$sam'?") {
+            $ok = Invoke-Safe -FriendlyError "Failed to disable user." -Action { Disable-ADAccount -Identity $sam -ErrorAction Stop }
+            if ($ok) { Write-Good "Disabled: $sam" }
+        }
+    } else {
+        if (Confirm-YesNo "Enable user '$sam'?") {
+            $ok = Invoke-Safe -FriendlyError "Failed to enable user." -Action { Enable-ADAccount -Identity $sam -ErrorAction Stop }
+            if ($ok) { Write-Good "Enabled: $sam" }
+        }
+    }
+}
+
+function ADU-UnlockUser {
+    Write-Section "Unlock AD User"
+    if (-not (AD-EnsureModule)) { return }
+
+    $sam = Read-Choice "Enter samAccountName"
+    if (-not (Require-NonEmpty $sam "samAccountName")) { return }
+
+    $u = Get-ADUser -Identity $sam -Properties LockedOut -ErrorAction SilentlyContinue
+    if (-not $u) { Show-UserError "User '$sam' not found."; return }
+    if (-not $u.LockedOut) { Write-Good "User is not locked out."; return }
+
+    if (Confirm-YesNo "Unlock '$sam'?") {
+        $ok = Invoke-Safe -FriendlyError "Failed to unlock user." -Action { Unlock-ADAccount -Identity $sam -ErrorAction Stop }
+        if ($ok) { Write-Good "Unlocked: $sam" }
+    }
+}
+
+function ADU-ResetPassword {
+    Write-Section "Reset AD User Password"
+    if (-not (AD-EnsureModule)) { return }
+
+    $sam = Read-Choice "Enter samAccountName"
+    if (-not (Require-NonEmpty $sam "samAccountName")) { return }
+
+    $u = Get-ADUser -Identity $sam -ErrorAction SilentlyContinue
+    if (-not $u) { Show-UserError "User '$sam' not found."; return }
+
+    $pwd = Read-Host "Enter new temporary password (hidden)" -AsSecureString
+    if (-not (Confirm-YesNo "Reset password for '$sam'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to reset password. Check policy complexity/length/history." -Action {
+        Set-ADAccountPassword -Identity $sam -Reset -NewPassword $pwd -ErrorAction Stop
+    }
+    if (-not $ok) { return }
+
+    Write-Good "Password reset completed for: $sam"
+
+    if (Confirm-YesNo "Force change password at next logon?") {
+        $ok2 = Invoke-Safe -FriendlyError "Failed to set ChangePasswordAtLogon." -Action {
+            Set-ADUser -Identity $sam -ChangePasswordAtLogon $true -ErrorAction Stop
+        }
+        if ($ok2) { Write-Good "ChangePasswordAtLogon enabled." }
+    }
+}
+
+function ADU-GroupAddRemove {
+    Write-Section "AD Group Membership (Add/Remove)"
+    if (-not (AD-EnsureModule)) { return }
+
+    $sam = Read-Choice "Enter user samAccountName"
+    if (-not (Require-NonEmpty $sam "User")) { return }
+
+    $u = Get-ADUser -Identity $sam -ErrorAction SilentlyContinue
+    if (-not $u) { Show-UserError "User '$sam' not found."; return }
+
+    $group = Read-Choice "Enter group name (SamAccountName or CN)"
+    if (-not (Require-NonEmpty $group "Group")) { return }
+
+    $g = Get-ADGroup -Identity $group -ErrorAction SilentlyContinue
+    if (-not $g) { Show-UserError "Group '$group' not found."; return }
+
+    Write-Host "1  Add user to group"
+    Write-Host "2  Remove user from group"
+    $c = Read-Choice "Choose"
+    if ($c -ne "1" -and $c -ne "2") { Show-UserError "Invalid choice."; return }
+
+    if ($c -eq "1") {
+        if (-not (Confirm-YesNo "Add '$sam' to '$group'?")) { return }
+        $ok = Invoke-Safe -FriendlyError "Failed to add user to group." -Action {
+            Add-ADGroupMember -Identity $group -Members $sam -ErrorAction Stop
+        }
+        if ($ok) { Write-Good "Added '$sam' to '$group'." }
+    }
+
+    if ($c -eq "2") {
+        if (-not (Confirm-YesNo "Remove '$sam' from '$group'?")) { return }
+        $ok = Invoke-Safe -FriendlyError "Failed to remove user from group." -Action {
+            Remove-ADGroupMember -Identity $group -Members $sam -Confirm:$false -ErrorAction Stop
+        }
+        if ($ok) { Write-Good "Removed '$sam' from '$group'." }
+    }
+}
+
+function ADU-SaveUsersToLog {
+    Write-Section "Save AD Users to Log"
+    if (-not (AD-EnsureModule)) { return }
+    Save-OutputToFile -FileName "AD_Users_Top500.txt" -Command {
+        Get-ADUser -Filter * -ResultSetSize 500 -Properties Enabled,LockedOut,LastLogonDate,PasswordLastSet |
+            Select-Object SamAccountName,Name,Enabled,LockedOut,LastLogonDate,PasswordLastSet |
+            Sort-Object SamAccountName
+    }
+}
+
+function ADUsers-Menu {
+    while ($true) {
+        Write-Section "AD Users"
+        Write-Host "1  List users"
+        Write-Host "2  Find user"
+        Write-Host "3  Create user"
+        Write-Host "4  Remove user"
+        Write-Host "5  Enable/Disable user"
+        Write-Host "6  Unlock user"
+        Write-Host "7  Reset password"
+        Write-Host "8  Add/Remove group membership"
+        Write-Host "9  Save users to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { ADU-ListUsers; Pause-PressEnter }
+            "2" { ADU-FindUser; Pause-PressEnter }
+            "3" { ADU-CreateUser; Pause-PressEnter }
+            "4" { ADU-RemoveUser; Pause-PressEnter }
+            "5" { ADU-EnableDisableUser; Pause-PressEnter }
+            "6" { ADU-UnlockUser; Pause-PressEnter }
+            "7" { ADU-ResetPassword; Pause-PressEnter }
+            "8" { ADU-GroupAddRemove; Pause-PressEnter }
+            "9" { ADU-SaveUsersToLog; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# AD COMPUTERS MENU
+# ==============================================================================
+
+function ADC-ListComputers {
+    Write-Section "AD Computers (Top 200)"
+    if (-not (AD-EnsureModule)) { return }
+    $null = Invoke-Safe -FriendlyError "Could not list AD computers." -Action {
+        Get-ADComputer -Filter * -ResultSetSize 200 -Properties Enabled,LastLogonDate,OperatingSystem |
+            Select-Object Name,Enabled,LastLogonDate,OperatingSystem |
+            Sort-Object Name |
+            Format-Table -AutoSize
+    }
+}
+
+function ADC-FindComputer {
+    Write-Section "Find AD Computer"
+    if (-not (AD-EnsureModule)) { return }
+    $q = Read-Choice "Enter computer name text (example: PC-01)"
+    if (-not (Require-NonEmpty $q "Search text")) { return }
+
+    $null = Invoke-Safe -FriendlyError "Could not search AD computers." -Action {
+        $matches = Get-ADComputer -Filter "Name -like '*$q*'" -Properties Enabled,LastLogonDate,OperatingSystem,DistinguishedName
+        if (-not $matches) {
+            Write-Warn "No computers found matching '$q'."
+        } else {
+            $matches | Select-Object Name,Enabled,LastLogonDate,OperatingSystem,DistinguishedName | Format-Table -AutoSize
+        }
+    }
+}
+
+function ADC-DisableComputer {
+    Write-Section "Disable AD Computer Account"
+    if (-not (AD-EnsureModule)) { return }
+    $name = Read-Choice "Enter computer name (example: PC-01)"
+    if (-not (Require-NonEmpty $name "Computer name")) { return }
+
+    $c = Get-ADComputer -Identity $name -Properties Enabled,DistinguishedName -ErrorAction SilentlyContinue
+    if (-not $c) { Show-UserError "Computer '$name' not found."; return }
+    if (-not $c.Enabled) { Write-Good "Computer already disabled."; return }
+
+    if (-not (Confirm-YesNo "Disable computer '$($c.Name)'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to disable computer." -Action {
+        Disable-ADAccount -Identity $c.DistinguishedName -ErrorAction Stop
+    }
+    if ($ok) { Write-Good "Disabled: $($c.Name)" }
+}
+
+function ADC-EnableComputer {
+    Write-Section "Enable AD Computer Account"
+    if (-not (AD-EnsureModule)) { return }
+    $name = Read-Choice "Enter computer name (example: PC-01)"
+    if (-not (Require-NonEmpty $name "Computer name")) { return }
+
+    $c = Get-ADComputer -Identity $name -Properties Enabled,DistinguishedName -ErrorAction SilentlyContinue
+    if (-not $c) { Show-UserError "Computer '$name' not found."; return }
+    if ($c.Enabled) { Write-Good "Computer already enabled."; return }
+
+    if (-not (Confirm-YesNo "Enable computer '$($c.Name)'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to enable computer." -Action {
+        Enable-ADAccount -Identity $c.DistinguishedName -ErrorAction Stop
+    }
+    if ($ok) { Write-Good "Enabled: $($c.Name)" }
+}
+
+function ADC-MoveComputerToOU {
+    Write-Section "Move AD Computer to OU"
+    if (-not (AD-EnsureModule)) { return }
+
+    $name = Read-Choice "Computer name (example: PC-01)"
+    if (-not (Require-NonEmpty $name "Computer name")) { return }
+
+    $targetOU = Read-Choice "Target OU DN (example: OU=Workstations,DC=contoso,DC=local)"
+    if (-not (Require-NonEmpty $targetOU "Target OU DN")) { return }
+    if (-not (Test-DistinguishedNameLike $targetOU)) {
+        Show-UserError "Target OU DN looks invalid. Example: OU=Workstations,DC=contoso,DC=local"
+        return
+    }
+
+    $c = Get-ADComputer -Identity $name -Properties DistinguishedName -ErrorAction SilentlyContinue
+    if (-not $c) { Show-UserError "Computer '$name' not found."; return }
+
+    Write-Info "Current DN: $($c.DistinguishedName)"
+    Write-Info "Target OU:  $targetOU"
+
+    if (-not (Confirm-YesNo "Move '$($c.Name)' to target OU?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to move computer to OU." -Action {
+        Move-ADObject -Identity $c.DistinguishedName -TargetPath $targetOU -ErrorAction Stop
+    }
+    if (-not $ok) { return }
+
+    $new = Get-ADComputer -Identity $name -Properties DistinguishedName -ErrorAction SilentlyContinue
+    if ($new -and $new.DistinguishedName -like "*$targetOU*") {
+        Write-Good "Moved successfully."
+    } else {
+        Write-Warn "Move completed, but verification was not conclusive. Re-check the computer DN."
+    }
+}
+
+function ADC-ComputerPasswordAgeReport {
+    Write-Section "Computer Password Age Report (Top 100)"
+    if (-not (AD-EnsureModule)) { return }
+
+    $null = Invoke-Safe -FriendlyError "Failed to generate computer password age report." -Action {
+        Get-ADComputer -Filter * -ResultSetSize 100 -Properties PasswordLastSet,LastLogonDate |
+            Select-Object Name,PasswordLastSet,LastLogonDate |
+            Sort-Object PasswordLastSet |
+            Format-Table -AutoSize
+    }
+}
+
+function ADC-SaveComputersToLog {
+    Write-Section "Save AD Computers to Log"
+    if (-not (AD-EnsureModule)) { return }
+    Save-OutputToFile -FileName "AD_Computers_Top500.txt" -Command {
+        Get-ADComputer -Filter * -ResultSetSize 500 -Properties Enabled,LastLogonDate,OperatingSystem,DistinguishedName,PasswordLastSet |
+            Select-Object Name,Enabled,LastLogonDate,OperatingSystem,PasswordLastSet,DistinguishedName |
+            Sort-Object Name
+    }
+}
+
+function ADComputers-Menu {
+    while ($true) {
+        Write-Section "AD Computers"
+        Write-Host "1  List computers"
+        Write-Host "2  Find computer"
+        Write-Host "3  Disable computer"
+        Write-Host "4  Enable computer"
+        Write-Host "5  Move computer to OU"
+        Write-Host "6  Computer password age report"
+        Write-Host "7  Save computers to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { ADC-ListComputers; Pause-PressEnter }
+            "2" { ADC-FindComputer; Pause-PressEnter }
+            "3" { ADC-DisableComputer; Pause-PressEnter }
+            "4" { ADC-EnableComputer; Pause-PressEnter }
+            "5" { ADC-MoveComputerToOU; Pause-PressEnter }
+            "6" { ADC-ComputerPasswordAgeReport; Pause-PressEnter }
+            "7" { ADC-SaveComputersToLog; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# AD POLICIES MENU (Default Domain Password Policy + FGPP)
+# ==============================================================================
+
+function ADP-ShowDefaultDomainPasswordPolicy {
+    Write-Section "Default Domain Password Policy"
+    if (-not (AD-EnsureModule)) { return }
+    $null = Invoke-Safe -FriendlyError "Could not read domain password policy." -Action {
+        $p = Get-ADDefaultDomainPasswordPolicy
+        $p | Select-Object ComplexityEnabled,MinPasswordLength,PasswordHistoryCount,MaxPasswordAge,MinPasswordAge,LockoutThreshold,LockoutDuration,LockoutObservationWindow |
+            Format-List
+    }
+}
+
+function ADP-SetDefaultDomainPasswordPolicy {
+    Write-Section "Set Default Domain Password Policy"
+    if (-not (AD-EnsureModule)) { return }
+
+    Write-Warn "WARNING: This changes DOMAIN password policy for everyone."
+    ADP-ShowDefaultDomainPasswordPolicy
+
+    $minLen = Read-Choice "Min password length (blank=skip)"
+    $hist   = Read-Choice "Password history count (blank=skip)"
+    $maxAge = Read-Choice "Max password age (days) (blank=skip)"
+    $lockTh = Read-Choice "Lockout threshold (blank=skip)"
+    $complex= Read-Choice "Complexity enabled? (true/false/blank=skip)"
+
+    $params = @{}
+
+    if ($minLen) { if ($minLen -notmatch '^\d+$') { Show-UserError "Min length must be a number."; return }; $params.MinPasswordLength = [int]$minLen }
+    if ($hist)   { if ($hist   -notmatch '^\d+$') { Show-UserError "History must be a number."; return }; $params.PasswordHistoryCount = [int]$hist }
+    if ($maxAge) { if ($maxAge -notmatch '^\d+$') { Show-UserError "Max age must be a number."; return }; $params.MaxPasswordAge = (New-TimeSpan -Days ([int]$maxAge)) }
+    if ($lockTh) { if ($lockTh -notmatch '^\d+$') { Show-UserError "Lockout threshold must be a number."; return }; $params.LockoutThreshold = [int]$lockTh }
+
+    if ($complex) {
+        $c = $complex.Trim().ToLower()
+        if ($c -ne "true" -and $c -ne "false") { Show-UserError "Complexity must be true or false."; return }
+        $params.ComplexityEnabled = [bool]::Parse($c)
+    }
+
+    if ($params.Keys.Count -eq 0) { Show-UserError "No changes entered."; return }
+
+    Write-Info "About to apply these domain policy changes:"
+    $params.GetEnumerator() | Sort-Object Name | Format-Table -AutoSize
+
+    if (-not (Confirm-YesNo "Apply these changes now?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to update domain password policy." -Action {
+        Set-ADDefaultDomainPasswordPolicy @params -ErrorAction Stop
+    }
+    if ($ok) {
+        Write-Good "Domain policy updated. New policy:"
+        ADP-ShowDefaultDomainPasswordPolicy
+    }
+}
+
+function ADP-ListFGPP {
+    Write-Section "Fine-Grained Password Policies (FGPP)"
+    if (-not (AD-EnsureModule)) { return }
+    $null = Invoke-Safe -FriendlyError "Failed to list FGPP policies." -Action {
+        $pol = Get-ADFineGrainedPasswordPolicy -Filter *
+        if (-not $pol) {
+            Write-Warn "No FGPP policies found."
+        } else {
+            $pol | Select-Object Name,Precedence,MinPasswordLength,ComplexityEnabled,PasswordHistoryCount,MaxPasswordAge,LockoutThreshold |
+                Sort-Object Precedence |
+                Format-Table -AutoSize
+        }
+    }
+}
+
+function ADP-ApplyFGPP {
+    Write-Section "Apply FGPP to User or Group"
+    if (-not (AD-EnsureModule)) { return }
+
+    $policyName = Read-Choice "FGPP Policy Name"
+    if (-not (Require-NonEmpty $policyName "Policy name")) { return }
+
+    $policy = Get-ADFineGrainedPasswordPolicy -Identity $policyName -ErrorAction SilentlyContinue
+    if (-not $policy) { Show-UserError "FGPP policy '$policyName' not found."; return }
+
+    $target = Read-Choice "Target user or group (samAccountName)"
+    if (-not (Require-NonEmpty $target "Target")) { return }
+
+    $targetObj = Get-ADUser  -Identity $target -ErrorAction SilentlyContinue
+    if (-not $targetObj) { $targetObj = Get-ADGroup -Identity $target -ErrorAction SilentlyContinue }
+    if (-not $targetObj) { Show-UserError "Target '$target' was not found as a user or a group."; return }
+
+    if (-not (Confirm-YesNo "Apply FGPP '$policyName' to '$target'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to apply FGPP to target." -Action {
+        Add-ADFineGrainedPasswordPolicySubject -Identity $policyName -Subjects $target -ErrorAction Stop
+    }
+    if ($ok) { Write-Good "FGPP applied." }
+}
+
+function ADPolicies-Menu {
+    while ($true) {
+        Write-Section "AD Policies"
+        Write-Host "1  View Default Domain Password Policy"
+        Write-Host "2  Edit Default Domain Password Policy (careful)"
+        Write-Host "3  List Fine-Grained Password Policies (FGPP)"
+        Write-Host "4  Apply FGPP to user or group"
+        Write-Host "5  Save policy report to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { ADP-ShowDefaultDomainPasswordPolicy; Pause-PressEnter }
+            "2" { ADP-SetDefaultDomainPasswordPolicy; Pause-PressEnter }
+            "3" { ADP-ListFGPP; Pause-PressEnter }
+            "4" { ADP-ApplyFGPP; Pause-PressEnter }
+            "5" {
+                if (-not (AD-EnsureModule)) { Pause-PressEnter; break }
+                Save-OutputToFile -FileName "AD_Policies_Report.txt" -Command {
+                    "Default Domain Password Policy"
+                    Get-ADDefaultDomainPasswordPolicy |
+                        Select-Object ComplexityEnabled,MinPasswordLength,PasswordHistoryCount,MaxPasswordAge,MinPasswordAge,LockoutThreshold,LockoutDuration,LockoutObservationWindow
+                    "----"
+                    "FGPP"
+                    Get-ADFineGrainedPasswordPolicy -Filter * |
+                        Select-Object Name,Precedence,MinPasswordLength,ComplexityEnabled,PasswordHistoryCount,MaxPasswordAge,LockoutThreshold |
+                        Sort-Object Precedence
+                }
+                Pause-PressEnter
+            }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# GPO QUICK VIEW MENU
+# ==============================================================================
+
+function GPO-ListAll {
+    Write-Section "GPO List (Top 200)"
+    if (-not (GPO-EnsureModule)) { return }
+    $null = Invoke-Safe -FriendlyError "Could not list GPOs." -Action {
+        Get-GPO -All | Sort-Object DisplayName |
+            Select-Object -First 200 DisplayName,Id,GpoStatus,CreationTime,ModificationTime |
+            Format-Table -AutoSize
+    }
+}
+
+function GPO-SearchByName {
+    Write-Section "Search GPO by Name"
+    if (-not (GPO-EnsureModule)) { return }
+    $q = Read-Choice "Enter text to search"
+    if (-not (Require-NonEmpty $q "Search text")) { return }
+
+    $null = Invoke-Safe -FriendlyError "Could not search GPOs." -Action {
+        $all = Get-GPO -All | Where-Object { $_.DisplayName -like "*$q*" }
+        if (-not $all) {
+            Write-Warn "No GPOs found matching '$q'."
+        } else {
+            $all | Select-Object DisplayName,Id,GpoStatus,ModificationTime | Format-Table -AutoSize
+        }
+    }
+}
+
+function GPO-ShowLinksForTarget {
+    Write-Section "GPO Link Status (OU or Domain)"
+    if (-not (GPO-EnsureModule)) { return }
+
+    Write-Host "Enter ONE of these:" -ForegroundColor DarkGray
+    Write-Host " - OU DN: OU=Workstations,DC=contoso,DC=local" -ForegroundColor DarkGray
+    Write-Host " - Domain DNS: contoso.local" -ForegroundColor DarkGray
+    Write-Host " - Domain DN:  DC=contoso,DC=local" -ForegroundColor DarkGray
+
+    $raw = Read-Choice "Enter OU DN or Domain (DNS/DN)"
+    if (-not (Require-NonEmpty $raw "Target")) { return }
+
+    $targetDN = Resolve-GPTargetToDN -InputText $raw
+    if (-not $targetDN) {
+        Show-UserError "Invalid target '$raw'. Use OU=...,DC=... OR a real domain name like contoso.local."
+        return
+    }
+
+    $inherit = $null
+    $ok = Invoke-Safe -FriendlyError "Could not get GPO inheritance. Check DN/domain is correct and you have permission." -Action {
+        $inherit = Get-GPInheritance -Target $targetDN -ErrorAction Stop
+        $inherit
+    }
+    if (-not $ok -or -not $inherit) { return }
+
+    Write-Info "Target: $targetDN"
+
+    Write-Host ""
+    Write-Info "Direct GPO Links:"
+    if ($inherit.GpoLinks -and $inherit.GpoLinks.Count -gt 0) {
+        $inherit.GpoLinks | Select-Object DisplayName,Enabled,Enforced,Order | Format-Table -AutoSize
+    } else {
+        Write-Host "(none)" -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+    Write-Info "Inherited GPO Links:"
+    if ($inherit.InheritedGpoLinks -and $inherit.InheritedGpoLinks.Count -gt 0) {
+        $inherit.InheritedGpoLinks | Select-Object DisplayName,Enabled,Enforced,Order | Format-Table -AutoSize
+    } else {
+        Write-Host "(none)" -ForegroundColor DarkGray
+    }
+}
+
+function GPO-SaveAllToLog {
+    Write-Section "Save GPO List to Log"
+    if (-not (GPO-EnsureModule)) { return }
+    Save-OutputToFile -FileName "GPO_List_All.txt" -Command {
+        Get-GPO -All | Sort-Object DisplayName |
+            Select-Object DisplayName,Id,GpoStatus,CreationTime,ModificationTime
+    }
+}
+
+function GPO-Menu {
+    while ($true) {
+        Write-Section "GPO Quick View"
+        Write-Host "1  List GPOs"
+        Write-Host "2  Search GPO by name"
+        Write-Host "3  Show GPO link status for OU/Domain (direct + inherited)"
+        Write-Host "4  Save GPO list to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { GPO-ListAll; Pause-PressEnter }
+            "2" { GPO-SearchByName; Pause-PressEnter }
+            "3" { GPO-ShowLinksForTarget; Pause-PressEnter }
+            "4" { GPO-SaveAllToLog; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# DNS MENU
+# ==============================================================================
+
+function DNS-ListZones {
+    Write-Section "DNS Zones"
+    if (-not (DNS-EnsureModule)) { return }
+    $null = Invoke-Safe -FriendlyError "Could not list DNS zones." -Action {
+        Get-DnsServerZone |
+            Select-Object ZoneName,ZoneType,IsDsIntegrated,IsReverseLookupZone,IsAutoCreated |
+            Sort-Object ZoneName |
+            Format-Table -AutoSize
+    }
+}
+
+function DNS-ListRecords {
+    Write-Section "DNS Records (Zone)"
+    if (-not (DNS-EnsureModule)) { return }
+
+    $zone = Read-Choice "Zone name (example: contoso.local)"
+    if (-not (Require-NonEmpty $zone "Zone name")) { return }
+
+    $z = Get-DnsServerZone -Name $zone -ErrorAction SilentlyContinue
+    if (-not $z) { Show-UserError "Zone '$zone' not found."; return }
+
+    $null = Invoke-Safe -FriendlyError "Could not list DNS records for zone '$zone'." -Action {
+        Get-DnsServerResourceRecord -ZoneName $zone |
+            Select-Object -First 250 HostName,RecordType,TimeToLive,Timestamp,RecordData |
+            Format-Table -AutoSize
+    }
+}
+
+function DNS-AddARecord {
+    Write-Section "Add DNS A Record"
+    if (-not (DNS-EnsureModule)) { return }
+
+    $zone = Read-Choice "Zone name"
+    if (-not (Require-NonEmpty $zone "Zone name")) { return }
+
+    $z = Get-DnsServerZone -Name $zone -ErrorAction SilentlyContinue
+    if (-not $z) { Show-UserError "Zone '$zone' not found."; return }
+
+    $name = Read-Choice "Host name (example: server01) (no zone part)"
+    if (-not (Require-NonEmpty $name "Host name")) { return }
+
+    $ip = Read-Choice "IPv4 address (example: 192.168.1.50)"
+    if (-not (Require-NonEmpty $ip "IPv4 address")) { return }
+    if (-not (Test-IPv4 $ip)) { Show-UserError "Invalid IPv4 address '$ip'."; return }
+
+    if (-not (Confirm-YesNo "Add A record: $name.$zone -> $ip ?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to add A record." -Action {
+        Add-DnsServerResourceRecordA -ZoneName $zone -Name $name -IPv4Address $ip -TimeToLive 01:00:00 -ErrorAction Stop
+    }
+    if (-not $ok) { return }
+
+    $verify = Get-DnsServerResourceRecord -ZoneName $zone -Name $name -RRType "A" -ErrorAction SilentlyContinue
+    if ($verify) { Write-Good "A record created." } else { Write-Warn "Command completed, but record verification failed." }
+}
+
+function DNS-RemoveRecord {
+    Write-Section "Remove DNS Record"
+    if (-not (DNS-EnsureModule)) { return }
+
+    $zone = Read-Choice "Zone name"
+    if (-not (Require-NonEmpty $zone "Zone name")) { return }
+
+    $z = Get-DnsServerZone -Name $zone -ErrorAction SilentlyContinue
+    if (-not $z) { Show-UserError "Zone '$zone' not found."; return }
+
+    $name = Read-Choice "Host name"
+    if (-not (Require-NonEmpty $name "Host name")) { return }
+
+    $type = Read-Choice "Record type (A, CNAME, TXT, etc.)"
+    if (-not (Require-NonEmpty $type "Record type")) { return }
+
+    $recs = $null
+    $ok = Invoke-Safe -FriendlyError "Could not find records (check name/type/zone)." -Action {
+        $recs = Get-DnsServerResourceRecord -ZoneName $zone -Name $name -RRType $type -ErrorAction Stop
+        $recs
+    }
+    if (-not $ok -or -not $recs) { Show-UserError "No matching records found."; return }
+
+    $recs | Select-Object HostName,RecordType,TimeToLive,RecordData | Format-Table -AutoSize
+
+    if (-not (Confirm-YesNo "Remove ALL shown records for $name ($type) in $zone ?")) { return }
+
+    $ok2 = Invoke-Safe -FriendlyError "Failed to remove DNS record(s)." -Action {
+        $recs | Remove-DnsServerResourceRecord -ZoneName $zone -Force -ErrorAction Stop
+    }
+    if ($ok2) { Write-Good "Record(s) removed." }
+}
+
+function DNS-ExportZone {
+    Write-Section "Export DNS Zone"
+    if (-not (DNS-EnsureModule)) { return }
+
+    $zone = Read-Choice "Zone name to export"
+    if (-not (Require-NonEmpty $zone "Zone name")) { return }
+
+    $z = Get-DnsServerZone -Name $zone -ErrorAction SilentlyContinue
+    if (-not $z) { Show-UserError "Zone '$zone' not found."; return }
+
+    if (-not (Confirm-YesNo "Export zone '$zone' records to log folder?")) { return }
+
+    Save-OutputToFile -FileName ("DNS_ZoneDump_{0}.txt" -f $zone) -Command {
+        Get-DnsServerResourceRecord -ZoneName $zone
+    }
+}
+
+function DNS-Menu {
+    while ($true) {
+        Write-Section "DNS"
+        Write-Host "1  List zones"
+        Write-Host "2  List records (zone)"
+        Write-Host "3  Add A record"
+        Write-Host "4  Remove record"
+        Write-Host "5  Export zone records to log"
+        Write-Host "6  Save DNS zone list to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { DNS-ListZones; Pause-PressEnter }
+            "2" { DNS-ListRecords; Pause-PressEnter }
+            "3" { DNS-AddARecord; Pause-PressEnter }
+            "4" { DNS-RemoveRecord; Pause-PressEnter }
+            "5" { DNS-ExportZone; Pause-PressEnter }
+            "6" { if (-not (DNS-EnsureModule)) { Pause-PressEnter; break }; Save-OutputToFile -FileName "DNS_Zones.txt" -Command { Get-DnsServerZone | Sort-Object ZoneName }; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# DHCP MENU
+# ==============================================================================
+
+function DHCP-ListScopes {
+    Write-Section "DHCP Scopes"
+    if (-not (DHCP-EnsureModule)) { return }
+    $null = Invoke-Safe -FriendlyError "Could not list DHCP scopes." -Action {
+        Get-DhcpServerv4Scope |
+            Select-Object ScopeId,Name,State,StartRange,EndRange,SubnetMask,LeaseDuration |
+            Sort-Object ScopeId |
+            Format-Table -AutoSize
+    }
+}
+
+function DHCP-GetScopeOrExplain {
+    param([string]$ScopeText)
+
+    if (-not (Require-NonEmpty $ScopeText "ScopeId")) { return $null }
+
+    $scopeObj = $null
+    $ok = Invoke-Safe -FriendlyError "Could not read DHCP scope '$ScopeText'." -Action {
+        $scopeObj = Get-DhcpServerv4Scope -ScopeId $ScopeText -ErrorAction Stop
+        $scopeObj
+    }
+
+    if (-not $ok -or -not $scopeObj) {
+        Show-UserError "Scope '$ScopeText' not found. Use 'List scopes' to see valid ScopeId values."
+        return $null
+    }
+
+    return $scopeObj
+}
+
+function DHCP-ListLeases {
+    Write-Section "DHCP Leases (Scope)"
+    if (-not (DHCP-EnsureModule)) { return }
+
+    $scopeText = Read-Choice "Enter ScopeId (example: 192.168.1.0)"
+    $scope = DHCP-GetScopeOrExplain $scopeText
+    if (-not $scope) { return }
+
+    $null = Invoke-Safe -FriendlyError "Could not list leases for scope '$scopeText'." -Action {
+        $leases = Get-DhcpServerv4Lease -ScopeId $scopeText
+        if (-not $leases) {
+            Write-Warn "No leases found in this scope."
+        } else {
+            $leases | Select-Object -First 250 IPAddress,HostName,ClientId,AddressState,LeaseExpiryTime | Format-Table -AutoSize
+        }
+    }
+}
+
+function DHCP-ListReservations {
+    Write-Section "DHCP Reservations (Scope)"
+    if (-not (DHCP-EnsureModule)) { return }
+
+    $scopeText = Read-Choice "Enter ScopeId (example: 192.168.1.0)"
+    $scope = DHCP-GetScopeOrExplain $scopeText
+    if (-not $scope) { return }
+
+    $null = Invoke-Safe -FriendlyError "Could not list reservations for scope '$scopeText'." -Action {
+        $res = Get-DhcpServerv4Reservation -ScopeId $scopeText
+        if (-not $res) {
+            Write-Warn "No reservations found in this scope."
+        } else {
+            $res | Select-Object IPAddress,ClientId,Name,Description | Sort-Object IPAddress | Format-Table -AutoSize
+        }
+    }
+}
+
+function DHCP-AddReservation {
+    Write-Section "Add DHCP Reservation"
+    if (-not (DHCP-EnsureModule)) { return }
+
+    $scopeText = Read-Choice "ScopeId (example: 192.168.1.0)"
+    $scope = DHCP-GetScopeOrExplain $scopeText
+    if (-not $scope) { return }
+
+    $ip = Read-Choice "Reservation IP (example: 192.168.1.50)"
+    if (-not (Require-NonEmpty $ip "IP address")) { return }
+    if (-not (Test-IPv4 $ip)) { Show-UserError "Invalid IPv4 address '$ip'."; return }
+
+    $mac = Read-Choice "ClientId / MAC (example: 00-11-22-33-44-55)"
+    if (-not (Require-NonEmpty $mac "ClientId/MAC")) { return }
+
+    $name = Read-Choice "Name (example: Printer01)"
+    if (-not (Require-NonEmpty $name "Name")) { return }
+
+    $desc = Read-Choice "Description (optional)"
+
+    if (-not (Confirm-YesNo "Add reservation $ip for $mac in scope $scopeText?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to add DHCP reservation (check IP in scope and MAC format)." -Action {
+        Add-DhcpServerv4Reservation -ScopeId $scopeText -IPAddress $ip -ClientId $mac -Name $name -Description $desc -ErrorAction Stop
+    }
+    if (-not $ok) { return }
+
+    $ver = Get-DhcpServerv4Reservation -ScopeId $scopeText -IPAddress $ip -ErrorAction SilentlyContinue
+    if ($ver) { Write-Good "Reservation added." } else { Write-Warn "Command completed, but verification failed." }
+}
+
+function DHCP-RemoveReservation {
+    Write-Section "Remove DHCP Reservation"
+    if (-not (DHCP-EnsureModule)) { return }
+
+    $scopeText = Read-Choice "ScopeId"
+    $scope = DHCP-GetScopeOrExplain $scopeText
+    if (-not $scope) { return }
+
+    $ip = Read-Choice "Reservation IP to remove"
+    if (-not (Require-NonEmpty $ip "IP address")) { return }
+    if (-not (Test-IPv4 $ip)) { Show-UserError "Invalid IPv4 address '$ip'."; return }
+
+    $res = Get-DhcpServerv4Reservation -ScopeId $scopeText -IPAddress $ip -ErrorAction SilentlyContinue
+    if (-not $res) { Show-UserError "Reservation for IP '$ip' not found in scope '$scopeText'."; return }
+
+    if (-not (Confirm-YesNo "Remove reservation $ip from scope $scopeText?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to remove reservation." -Action {
+        Remove-DhcpServerv4Reservation -ScopeId $scopeText -IPAddress $ip -Confirm:$false -ErrorAction Stop
+    }
+    if (-not $ok) { return }
+
+    $still = Get-DhcpServerv4Reservation -ScopeId $scopeText -IPAddress $ip -ErrorAction SilentlyContinue
+    if ($still) { Show-UserError "Remove command ran, but reservation still exists."; return }
+
+    Write-Good "Reservation removed."
+}
+
+function DHCP-ExportNetsh {
+    Write-Section "DHCP Export (netsh)"
+    if (-not (DHCP-EnsureModule)) { return }
+
+    $default = Join-Path $Global:SessionLogDir "DHCP_Export_$($Global:DateTag).txt"
+    $path = Read-Choice "Export file path (blank = $default)"
+    if ([string]::IsNullOrWhiteSpace($path)) { $path = $default }
+
+    if (-not (Confirm-YesNo "Export DHCP config to '$path'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "DHCP export failed." -Action {
+        netsh dhcp server export "$path" all | Out-Null
+    }
+    if ($ok -and (Test-Path $path)) { Write-Good "DHCP exported: $path" }
+    elseif ($ok) { Write-Warn "Export command completed but export file was not found. Check path/permissions." }
+}
+
+function DHCP-ImportNetsh {
+    Write-Section "DHCP Import (netsh)"
+    if (-not (DHCP-EnsureModule)) { return }
+
+    Write-Warn "WARNING: Import can change/replace DHCP configuration."
+    $path = Read-Choice "Import file path"
+    if (-not (Require-NonEmpty $path "Import file path")) { return }
+    if (-not (Test-Path $path)) { Show-UserError "File not found: $path"; return }
+
+    if (-not (Confirm-YesNo "IMPORT DHCP config from '$path'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "DHCP import failed." -Action {
+        netsh dhcp server import "$path" all | Out-Null
+    }
+    if ($ok) { Write-Good "DHCP import command completed. Verify scopes/options in DHCP console." }
+}
+
+function DHCP-Menu {
+    while ($true) {
+        Write-Section "DHCP"
+        Write-Host "1  List scopes"
+        Write-Host "2  List leases (scope)"
+        Write-Host "3  List reservations (scope)"
+        Write-Host "4  Add reservation"
+        Write-Host "5  Remove reservation"
+        Write-Host "6  Export DHCP config (netsh)"
+        Write-Host "7  Import DHCP config (netsh)"
+        Write-Host "8  Save DHCP scope list to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { DHCP-ListScopes; Pause-PressEnter }
+            "2" { DHCP-ListLeases; Pause-PressEnter }
+            "3" { DHCP-ListReservations; Pause-PressEnter }
+            "4" { DHCP-AddReservation; Pause-PressEnter }
+            "5" { DHCP-RemoveReservation; Pause-PressEnter }
+            "6" { DHCP-ExportNetsh; Pause-PressEnter }
+            "7" { DHCP-ImportNetsh; Pause-PressEnter }
+            "8" { if (-not (DHCP-EnsureModule)) { Pause-PressEnter; break }; Save-OutputToFile -FileName "DHCP_Scopes.txt" -Command { Get-DhcpServerv4Scope | Sort-Object ScopeId }; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# FIREWALL MENU + ZERO TRUST + ALLOW LIST
+# ==============================================================================
+
+function FW-ShowProfiles {
+    Write-Section "Firewall Profiles"
+    $null = Invoke-Safe -FriendlyError "Could not read firewall profiles." -Action {
+        Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction | Format-Table -AutoSize
+    }
+}
+
+function FW-ListRules {
+    Write-Section "Firewall Rules (Top 200)"
+    $null = Invoke-Safe -FriendlyError "Could not list firewall rules." -Action {
+        Get-NetFirewallRule |
+            Select-Object -First 200 DisplayName,Enabled,Direction,Action,Profile,Group |
+            Format-Table -AutoSize
+    }
+}
+
+function FW-SearchRules {
+    Write-Section "Search Firewall Rules"
+    $q = Read-Choice "Enter search text (DisplayName contains)"
+    if (-not (Require-NonEmpty $q "Search text")) { return }
+
+    $null = Invoke-Safe -FriendlyError "Could not search firewall rules." -Action {
+        $m = Get-NetFirewallRule | Where-Object { $_.DisplayName -like "*$q*" }
+        if (-not $m) {
+            Write-Warn "No rules found matching '$q'."
+        } else {
+            $m | Select-Object DisplayName,Enabled,Direction,Action,Profile,Group | Format-Table -AutoSize
+        }
+    }
+}
+
+function FW-EnableDisableRule {
+    Write-Section "Enable / Disable Firewall Rule"
+
+    $q = Read-Choice "Enter part of the DisplayName to search"
+    if (-not (Require-NonEmpty $q "Search text")) { return }
+
+    $matches = $null
+    $ok = Invoke-Safe -FriendlyError "Could not search firewall rules." -Action {
+        $matches = Get-NetFirewallRule | Where-Object { $_.DisplayName -like "*$q*" }
+        $matches
+    }
+    if (-not $ok) { return }
+
+    if (-not $matches) { Show-UserError "No rules found matching '$q'."; return }
+
+    $matches | Select-Object DisplayName,Enabled,Direction,Action,Profile,Group | Format-Table -AutoSize
+
+    $name = Read-Choice "Type the EXACT DisplayName to change"
+    if (-not (Require-NonEmpty $name "DisplayName")) { return }
+
+    $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+    if (-not $rule) { Show-UserError "Rule '$name' not found. Copy/paste exact name from the list."; return }
+
+    Write-Info "Current Enabled = $($rule.Enabled)"
+    if ($rule.Enabled -eq "True") {
+        if (Confirm-YesNo "Disable this rule?") {
+            $ok2 = Invoke-Safe -FriendlyError "Failed to disable rule." -Action { Disable-NetFirewallRule -DisplayName $name -ErrorAction Stop }
+            if ($ok2) {
+                $check = (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue).Enabled
+                if ($check -ne "True") { Write-Good "Disabled." } else { Write-Warn "Command completed but state did not change." }
+            }
+        }
+    } else {
+        if (Confirm-YesNo "Enable this rule?") {
+            $ok2 = Invoke-Safe -FriendlyError "Failed to enable rule." -Action { Enable-NetFirewallRule -DisplayName $name -ErrorAction Stop }
+            if ($ok2) {
+                $check = (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue).Enabled
+                if ($check -eq "True") { Write-Good "Enabled." } else { Write-Warn "Command completed but state did not change." }
+            }
+        }
+    }
+}
+
+function FW-BlockPortInbound {
+    Write-Section "Block TCP Port Inbound (Toolkit Rule)"
+    $portText = Read-Choice "Enter TCP port to BLOCK inbound (1-65535)"
+    if (-not (Require-NonEmpty $portText "Port")) { return }
+    if (-not (Test-Port $portText)) { Show-UserError "Invalid port '$portText'. Must be 1-65535."; return }
+    $port = [int]$portText
+
+    $ruleName = "ATK Block TCP $port Inbound"
+    if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) {
+        Show-UserError "Rule already exists: $ruleName"
+        return
+    }
+
+    if (-not (Confirm-YesNo "Create inbound BLOCK rule for TCP $port?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to create block rule." -Action {
+        New-NetFirewallRule -DisplayName $ruleName -Group $Global:FirewallGroup_Blocks `
+            -Direction Inbound -Action Block -Protocol TCP -LocalPort $port -Profile Any -ErrorAction Stop | Out-Null
+    }
+    if (-not $ok) { return }
+
+    $verify = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if ($verify) { Write-Good "Blocked inbound TCP $port (rule created)." } else { Write-Warn "Command completed but rule not found afterwards." }
+}
+
+function FW-UnblockPortInbound {
+    Write-Section "Unblock TCP Port Inbound (Remove Toolkit Rule)"
+    $portText = Read-Choice "Enter TCP port to UNBLOCK inbound (1-65535)"
+    if (-not (Require-NonEmpty $portText "Port")) { return }
+    if (-not (Test-Port $portText)) { Show-UserError "Invalid port '$portText'."; return }
+    $port = [int]$portText
+
+    $ruleName = "ATK Block TCP $port Inbound"
+    $r = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if (-not $r) { Show-UserError "Toolkit rule not found: $ruleName"; return }
+
+    if (-not (Confirm-YesNo "Remove rule '$ruleName'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to remove firewall rule." -Action {
+        Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction Stop
+    }
+    if (-not $ok) { return }
+
+    $still = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if ($still) { Show-UserError "Remove command ran, but rule still exists."; return }
+
+    Write-Good "Removed block rule."
+}
+
+function FW-ExportRulesCSV {
+    Write-Section "Export Firewall Rules (CSV)"
+    $csv = Join-Path $Global:SessionLogDir "FirewallRules_All.csv"
+    $ok = Invoke-Safe -FriendlyError "Failed to export firewall rules." -Action {
+        Get-NetFirewallRule | Sort-Object DisplayName |
+            Select-Object DisplayName,Enabled,Direction,Action,Profile,Group,PolicyStoreSourceType |
+            Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+    }
+    if ($ok -and (Test-Path $csv)) { Write-Good "Exported: $csv" }
+    elseif ($ok) { Write-Warn "Export command completed, but CSV file was not found. Check permissions." }
+}
+
+function FW-BackupNetsh {
+    Write-Section "Backup Firewall Config (netsh export)"
+    $defaultPath = Join-Path $Global:SessionLogDir "FirewallBackup_$($Global:DateTag).wfw"
+    $path = Read-Choice "Backup path (blank = $defaultPath)"
+    if ([string]::IsNullOrWhiteSpace($path)) { $path = $defaultPath }
+
+    if (-not (Confirm-YesNo "Export firewall config to '$path'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Firewall export failed." -Action {
+        netsh advfirewall export "$path" | Out-Null
+    }
+    if ($ok -and (Test-Path $path)) { Write-Good "Exported: $path" }
+    elseif ($ok) { Write-Warn "Export command completed, but file not found. Check path." }
+}
+
+function FW-RestoreNetsh {
+    Write-Section "Restore Firewall Config (netsh import)"
+    Write-Warn "WARNING: Import replaces current firewall policy."
+    $path = Read-Choice "Enter .wfw file path"
+    if (-not (Require-NonEmpty $path "File path")) { return }
+    if (-not (Test-Path $path)) { Show-UserError "File not found: $path"; return }
+
+    if (-not (Confirm-YesNo "IMPORT firewall config from '$path'?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Firewall import failed." -Action {
+        netsh advfirewall import "$path" | Out-Null
+    }
+    if ($ok) { Write-Good "Import completed. Verify firewall profiles/rules." }
+}
+
+function Firewall-Menu {
+    while ($true) {
+        Write-Section "Firewall"
+        Write-Host "1  List rules"
+        Write-Host "2  Search rules"
+        Write-Host "3  Enable/Disable a rule"
+        Write-Host "4  Show firewall profiles"
+        Write-Host "5  Block TCP port inbound (tool rule)"
+        Write-Host "6  Unblock TCP port inbound (remove tool rule)"
+        Write-Host "7  Export ALL rules to CSV"
+        Write-Host "8  Backup firewall config (netsh export)"
+        Write-Host "9  Restore firewall config (netsh import)"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { FW-ListRules; Pause-PressEnter }
+            "2" { FW-SearchRules; Pause-PressEnter }
+            "3" { FW-EnableDisableRule; Pause-PressEnter }
+            "4" { FW-ShowProfiles; Pause-PressEnter }
+            "5" { FW-BlockPortInbound; Pause-PressEnter }
+            "6" { FW-UnblockPortInbound; Pause-PressEnter }
+            "7" { FW-ExportRulesCSV; Pause-PressEnter }
+            "8" { FW-BackupNetsh; Pause-PressEnter }
+            "9" { FW-RestoreNetsh; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+function ZeroTrust-EnableBlockAll {
+    Write-Section "ZERO TRUST - Block All Inbound + Outbound"
+    Write-Warn "This sets ALL profiles to: inbound BLOCK and outbound BLOCK."
+    Write-Warn "It can break RDP/DNS/DHCP/AD. Use VM console access."
+    if (-not (Confirm-YesNo "Are you sure you want to ENABLE block all?")) { return }
+    if (-not (Confirm-YesNo "Second confirmation: ENABLE block all now?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to enable Zero Trust block-all." -Action {
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Block -ErrorAction Stop
+    }
+    if ($ok) { Write-Good "Zero Trust block-all enabled." }
+}
+
+function ZeroTrust-RestoreDefaults {
+    Write-Section "Restore Firewall Defaults"
+    Write-Info "Sets: inbound BLOCK, outbound ALLOW"
+    if (-not (Confirm-YesNo "Apply defaults now?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to restore defaults." -Action {
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow -ErrorAction Stop
+    }
+    if ($ok) { Write-Good "Defaults restored." }
+}
+
+function ZeroTrust-Menu {
+    while ($true) {
+        Write-Section "Zero Trust"
+        Write-Host "1  ENABLE block all inbound + outbound"
+        Write-Host "2  Restore defaults (inbound block, outbound allow)"
+        Write-Host "3  Show firewall profile settings"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { ZeroTrust-EnableBlockAll; Pause-PressEnter }
+            "2" { ZeroTrust-RestoreDefaults; Pause-PressEnter }
+            "3" { FW-ShowProfiles; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+function AllowList-RemoveToolkitRules {
+    Write-Section "Remove Allow-List Toolkit Rules"
+    $rules = Get-NetFirewallRule -Group $Global:FirewallGroup_AllowList -ErrorAction SilentlyContinue
+    if (-not $rules) { Write-Warn "No allow-list rules found in group '$Global:FirewallGroup_AllowList'."; return }
+
+    $rules | Select-Object DisplayName,Enabled,Direction,Action,Profile | Format-Table -AutoSize
+    if (-not (Confirm-YesNo "Remove ALL allow-list rules created by the toolkit?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed to remove allow-list rules." -Action {
+        $rules | Remove-NetFirewallRule -ErrorAction Stop
+    }
+    if ($ok) { Write-Good "Allow-list rules removed." }
+}
+
+function AllowList-Wizard {
+    Write-Section "Allow-List Wizard (After Zero Trust)"
+
+    $ipInfo = Get-PrimaryIPv4Info
+    if ($ipInfo) {
+        Write-Host "Server IPv4: $($ipInfo.IPAddress)/$($ipInfo.PrefixLength)" -ForegroundColor DarkGray
+        Write-Host "Suggested mgmt scope: $($ipInfo.SuggestedCIDR)" -ForegroundColor DarkGray
+    } else {
+        Write-Warn "Could not auto-detect primary IPv4."
+    }
+
+    $suggest = $null
+    if ($ipInfo) { $suggest = $ipInfo.SuggestedCIDR }
+
+    $mgmtScope = Read-Choice "Enter management IP or subnet (blank = $suggest)"
+    if ([string]::IsNullOrWhiteSpace($mgmtScope)) { $mgmtScope = $suggest }
+    if (-not $mgmtScope) { Show-UserError "No management scope provided."; return }
+
+    $tightInbound = Confirm-YesNo "Restrict inbound allow rules to management scope only?"
+    $inboundRemote = "Any"
+    if ($tightInbound) { $inboundRemote = $mgmtScope }
+
+    $allowRDP   = Confirm-YesNo "Allow RDP inbound (TCP 3389)?"
+    $allowWinRM = Confirm-YesNo "Allow WinRM inbound (TCP 5985/5986)?"
+    $allowDNS   = Confirm-YesNo "Allow DNS outbound (TCP/UDP 53)?"
+    $allowDHCP  = Confirm-YesNo "Allow DHCP (UDP 67/68)?"
+    $allowNTP   = Confirm-YesNo "Allow NTP outbound (UDP 123)?"
+
+    $isDC = Test-IsDomainController
+    $allowDC = $false
+    if ($isDC) {
+        Write-Warn "DC detected. Optionally allow common DC ports (restricted to mgmt scope if you chose that)."
+        $allowDC = Confirm-YesNo "Allow common DC inbound ports (Kerberos/LDAP/SMB/RPC core)?"
+    }
+
+    Write-Info "Rules will be grouped under: '$Global:FirewallGroup_AllowList'"
+    if (-not (Confirm-YesNo "Create allow rules now?")) { return }
+
+    $ok = Invoke-Safe -FriendlyError "Failed while creating allow-list rules." -Action {
+        if ($allowRDP) {
+            New-NetFirewallRule -DisplayName "ATK Allow RDP Inbound" -Group $Global:FirewallGroup_AllowList `
+                -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress $inboundRemote -Profile Any -ErrorAction Stop | Out-Null
+        }
+
+        if ($allowWinRM) {
+            New-NetFirewallRule -DisplayName "ATK Allow WinRM HTTP Inbound" -Group $Global:FirewallGroup_AllowList `
+                -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5985 -RemoteAddress $inboundRemote -Profile Any -ErrorAction Stop | Out-Null
+            New-NetFirewallRule -DisplayName "ATK Allow WinRM HTTPS Inbound" -Group $Global:FirewallGroup_AllowList `
+                -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5986 -RemoteAddress $inboundRemote -Profile Any -ErrorAction Stop | Out-Null
+        }
+
+        if ($allowDNS) {
+            New-NetFirewallRule -DisplayName "ATK Allow DNS Outbound UDP 53" -Group $Global:FirewallGroup_AllowList `
+                -Direction Outbound -Action Allow -Protocol UDP -RemotePort 53 -Profile Any -ErrorAction Stop | Out-Null
+            New-NetFirewallRule -DisplayName "ATK Allow DNS Outbound TCP 53" -Group $Global:FirewallGroup_AllowList `
+                -Direction Outbound -Action Allow -Protocol TCP -RemotePort 53 -Profile Any -ErrorAction Stop | Out-Null
+        }
+
+        if ($allowDHCP) {
+            New-NetFirewallRule -DisplayName "ATK Allow DHCP Inbound UDP 67-68" -Group $Global:FirewallGroup_AllowList `
+                -Direction Inbound -Action Allow -Protocol UDP -LocalPort 67,68 -RemoteAddress $inboundRemote -Profile Any -ErrorAction Stop | Out-Null
+            New-NetFirewallRule -DisplayName "ATK Allow DHCP Outbound UDP 67-68" -Group $Global:FirewallGroup_AllowList `
+                -Direction Outbound -Action Allow -Protocol UDP -RemotePort 67,68 -Profile Any -ErrorAction Stop | Out-Null
+        }
+
+        if ($allowNTP) {
+            New-NetFirewallRule -DisplayName "ATK Allow NTP Outbound UDP 123" -Group $Global:FirewallGroup_AllowList `
+                -Direction Outbound -Action Allow -Protocol UDP -RemotePort 123 -Profile Any -ErrorAction Stop | Out-Null
+        }
+
+        if ($allowDC) {
+            $dcTcp = "53,88,135,389,445,464,636,3268,3269,9389"
+            $dcUdp = "53,88,389,464"
+            New-NetFirewallRule -DisplayName "ATK Allow DC Core TCP Inbound" -Group $Global:FirewallGroup_AllowList `
+                -Direction Inbound -Action Allow -Protocol TCP -LocalPort $dcTcp -RemoteAddress $inboundRemote -Profile Any -ErrorAction Stop | Out-Null
+            New-NetFirewallRule -DisplayName "ATK Allow DC Core UDP Inbound" -Group $Global:FirewallGroup_AllowList `
+                -Direction Inbound -Action Allow -Protocol UDP -LocalPort $dcUdp -RemoteAddress $inboundRemote -Profile Any -ErrorAction Stop | Out-Null
+        }
+    }
+    if (-not $ok) { return }
+
+    Write-Good "Allow-list rules created."
+    Save-OutputToFile -FileName "AllowList_Rules_Created.txt" -Command {
+        Get-NetFirewallRule -Group $Global:FirewallGroup_AllowList | Select-Object DisplayName,Enabled,Direction,Action,Profile
+    }
+}
+
+function AllowList-Menu {
+    while ($true) {
+        Write-Section "Allow-List Wizard"
+        Write-Host "1  Run allow-list wizard"
+        Write-Host "2  List allow-list rules created by toolkit"
+        Write-Host "3  Remove allow-list rules created by toolkit"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { AllowList-Wizard; Pause-PressEnter }
+            "2" {
+                Write-Section "Toolkit Allow-List Rules"
+                $r = Get-NetFirewallRule -Group $Global:FirewallGroup_AllowList -ErrorAction SilentlyContinue
+                if ($r) { $r | Select-Object DisplayName,Enabled,Direction,Action,Profile | Format-Table -AutoSize }
+                else { Write-Warn "No allow-list rules found." }
+                Pause-PressEnter
+            }
+            "3" { AllowList-RemoveToolkitRules; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# WINRM MENU
+# ==============================================================================
+
+function WinRM-ShowStatus {
+    Write-Section "WinRM Status"
+    $null = Invoke-Safe -FriendlyError "Could not read WinRM status." -Action {
+        Get-Service WinRM | Select-Object Name,Status,StartType | Format-Table -AutoSize
+        Write-Host ""
+        Write-Info "TrustedHosts:"
+        $th = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value
+        if ([string]::IsNullOrWhiteSpace($th)) { $th = "(empty)" }
+        Write-Host $th
+    }
+}
+
+function WinRM-Enable {
+    Write-Section "Enable WinRM"
+    Write-Warn "This runs Enable-PSRemoting, which can open firewall rules."
+    if (-not (Confirm-YesNo "Enable WinRM now?")) { return }
+    $ok = Invoke-Safe -FriendlyError "Failed to enable WinRM." -Action { Enable-PSRemoting -Force -ErrorAction Stop }
+    if ($ok) { Write-Good "WinRM enabled." }
+}
+
+function WinRM-Disable {
+    Write-Section "Disable WinRM"
+    if (-not (Confirm-YesNo "Disable WinRM now?")) { return }
+    $ok = Invoke-Safe -FriendlyError "Failed to disable WinRM." -Action {
+        Disable-PSRemoting -Force -ErrorAction SilentlyContinue
+        Stop-Service WinRM -Force -ErrorAction SilentlyContinue
+        Set-Service WinRM -StartupType Manual -ErrorAction SilentlyContinue
+    }
+    if ($ok) { Write-Good "WinRM disabled." }
+}
+
+function WinRM-SetTrustedHosts {
+    Write-Section "Set TrustedHosts"
+    Write-Warn "Do NOT set '*' unless you understand the security risk."
+    $value = Read-Choice "Enter TrustedHosts value (blank=cancel)"
+    if ([string]::IsNullOrWhiteSpace($value)) { return }
+    if (-not (Confirm-YesNo "Apply TrustedHosts '$value'?")) { return }
+    $ok = Invoke-Safe -FriendlyError "Failed to set TrustedHosts." -Action {
+        Set-Item WSMan:\localhost\Client\TrustedHosts -Value $value -Force -ErrorAction Stop
+    }
+    if ($ok) { Write-Good "TrustedHosts updated." }
+}
+
+function WinRM-Menu {
+    while ($true) {
+        Write-Section "WinRM"
+        Write-Host "1  Show status"
+        Write-Host "2  Enable WinRM (Enable-PSRemoting)"
+        Write-Host "3  Disable WinRM"
+        Write-Host "4  Set TrustedHosts"
+        Write-Host "5  Save WinRM info to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { WinRM-ShowStatus; Pause-PressEnter }
+            "2" { WinRM-Enable; Pause-PressEnter }
+            "3" { WinRM-Disable; Pause-PressEnter }
+            "4" { WinRM-SetTrustedHosts; Pause-PressEnter }
+            "5" {
+                Save-OutputToFile -FileName "WinRM_Status.txt" -Command {
+                    Get-Service WinRM | Select-Object Name,Status,StartType
+                    "TrustedHosts: " + (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value
+                }
+                Pause-PressEnter
+            }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# SMB HARDENING CHECK (READ ONLY)
+# ==============================================================================
+
+function SMB-GetRegistryValue {
+    param([string]$Path,[string]$Name)
+    try { (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { "(not set)" }
+}
+
+function SMB-HardeningCheck {
+    Write-Section "SMB Hardening Check (Read Only)"
+
+    $null = Invoke-Safe -FriendlyError "Could not read SMB configuration." -Action {
+        Write-Info "SMB Server Configuration:"
+        try {
+            $srv = Get-SmbServerConfiguration
+            [pscustomobject]@{
+                SMB1Enabled    = $srv.EnableSMB1Protocol
+                SMB2Enabled    = $srv.EnableSMB2Protocol
+                RequireSigning = $srv.RequireSecuritySignature
+                EnableSigning  = $srv.EnableSecuritySignature
+                EncryptData    = $srv.EncryptData
+            } | Format-List
+        } catch {
+            Write-Warn "Could not read SMB server configuration."
+        }
+
+        Write-Host ""
+        Write-Info "SMB Client Configuration:"
+        try {
+            $cli = Get-SmbClientConfiguration
+            [pscustomobject]@{
+                RequireSigning = $cli.RequireSecuritySignature
+                EnableSigning  = $cli.EnableSecuritySignature
+            } | Format-List
+        } catch {
+            Write-Warn "Could not read SMB client configuration."
+        }
+
+        Write-Host ""
+        Write-Info "Registry Indicators:"
+        Write-Host "LanmanServer SMB1 = $(SMB-GetRegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1')"
+        Write-Host "LmCompatibilityLevel = $(SMB-GetRegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LmCompatibilityLevel')"
+        Write-Host "RestrictReceivingNTLMTraffic = $(SMB-GetRegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0' 'RestrictReceivingNTLMTraffic')"
+    }
+}
+
+function SMB-Menu {
+    while ($true) {
+        Write-Section "SMB Hardening"
+        Write-Host "1  Run SMB hardening check"
+        Write-Host "2  Save SMB hardening report to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { SMB-HardeningCheck; Pause-PressEnter }
+            "2" { Save-OutputToFile -FileName "SMB_Hardening_Report.txt" -Command { SMB-HardeningCheck }; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# QUICK SCANS MENU
+# ==============================================================================
+
+function Scan-TCPPortsRange {
+    Write-Section "TCP Port Scan (Range)"
+    $target = Read-Choice "Target IP/Name (blank = localhost)"
+    if ([string]::IsNullOrWhiteSpace($target)) { $target = "127.0.0.1" }
+
+    $startText = Read-Choice "Start port (1-65535)"
+    $endText   = Read-Choice "End port (1-65535)"
+
+    if (-not (Test-Port $startText)) { Show-UserError "Invalid start port '$startText'."; return }
+    if (-not (Test-Port $endText))   { Show-UserError "Invalid end port '$endText'."; return }
+
+    $start = [int]$startText
+    $end   = [int]$endText
+
+    if ($start -gt $end) { Show-UserError "Start port must be <= end port."; return }
+
+    Write-Info "Scanning $target TCP ports $start to $end ..."
+    $open = New-Object System.Collections.Generic.List[int]
+
+    $ok = Invoke-Safe -FriendlyError "Port scan failed (check DNS/network permissions)." -Action {
+        for ($p = $start; $p -le $end; $p++) {
+            $isOpen = $false
+            try {
+                $isOpen = Test-NetConnection -ComputerName $target -Port $p -WarningAction SilentlyContinue -InformationLevel Quiet
+            } catch {}
+            if ($isOpen) { $open.Add($p) }
+        }
+        $open
+    }
+    if (-not $ok) { return }
+
+    if ($open.Count -eq 0) {
+        Write-Warn "No open TCP ports found in that range (or filtered)."
+        return
+    }
+
+    Write-Good "Open TCP ports:"
+    $open | Sort-Object | ForEach-Object { Write-Host $_ }
+
+    if (Confirm-YesNo "Save results to log file?") {
+        $safeTarget = ($target -replace '[\\/:*?"<>|]','_')
+        Save-OutputToFile -FileName "PortScan_${safeTarget}_${start}-${end}.txt" -Command { $open | Sort-Object }
+    }
+}
+
+function Scans-Menu {
+    while ($true) {
+        Write-Section "Quick Scans"
+        Write-Host "1  TCP port scan (range)"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { Scan-TCPPortsRange; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# SERVICES MENU (FIXED: CIM BASED, ALWAYS WORKS ON SERVER 2022)
+# ==============================================================================
+
+function Services-GetAll {
+    # This function gets all services using CIM so StartType is always available.
+    $services = $null
+    $ok = Invoke-Safe -FriendlyError "Could not read services using Win32_Service." -Action {
+        $services = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
+        $services
+    }
+    if (-not $ok) { return $null }
+    return $services
+}
+
+function Services-ListAll {
+    Write-Section "Services (Top 200)"
+    $services = Services-GetAll
+    if (-not $services) { return }
+
+    $rows = $services |
+        Sort-Object @{Expression="State";Descending=$true}, Name |
+        Select-Object -First 200 `
+            @{n="Name";e={$_.Name}},
+            @{n="DisplayName";e={$_.DisplayName}},
+            @{n="State";e={$_.State}},
+            @{n="StartType";e={$_.StartMode}}
+
+    $rows | Format-Table -AutoSize
+}
+
+function Services-Search {
+    Write-Section "Search Services"
+    $q = Read-Choice "Enter service name or display name text"
+    if (-not (Require-NonEmpty $q "Search text")) { return }
+
+    $services = Services-GetAll
+    if (-not $services) { return }
+
+    $matches = $services | Where-Object {
+        $_.Name -like "*$q*" -or $_.DisplayName -like "*$q*"
+    }
+
+    if (-not $matches) {
+        Write-Warn "No services found matching '$q'."
+        return
+    }
+
+    $matches |
+        Select-Object `
+            @{n="Name";e={$_.Name}},
+            @{n="DisplayName";e={$_.DisplayName}},
+            @{n="State";e={$_.State}},
+            @{n="StartType";e={$_.StartMode}} |
+        Sort-Object Name |
+        Format-Table -AutoSize
+}
+
+function Services-StopAndDisable {
+    Write-Section "Stop + Disable Service"
+    Write-Host "Tip: use Search Services first to get the exact service NAME." -ForegroundColor DarkGray
+
+    $name = Read-Choice "Enter exact service NAME (example: Spooler)"
+    if (-not (Require-NonEmpty $name "Service name")) { return }
+
+    $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Show-UserError "Service '$name' not found. Use Search Services to find the correct NAME."
+        return
+    }
+
+    Write-Info "Service: $($svc.Name)"
+    Write-Info "Display: $($svc.DisplayName)"
+    Write-Info "State:   $($svc.State)"
+    Write-Info "Start:   $($svc.StartMode)"
+
+    if (-not (Confirm-YesNo "Stop and disable this service now?")) { return }
+
+    $okStop = Invoke-Safe -FriendlyError "Failed to stop service '$name'." -Action {
+        $gs = Get-Service -Name $name -ErrorAction Stop
+        if ($gs.Status -ne "Stopped") {
+            Stop-Service -Name $name -Force -ErrorAction Stop
+        }
+    }
+    if (-not $okStop) { return }
+
+    $okDisable = Invoke-Safe -FriendlyError "Failed to disable service '$name'." -Action {
+        $svc2 = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+        $result = Invoke-CimMethod -InputObject $svc2 -MethodName ChangeStartMode -Arguments @{ StartMode = "Disabled" } -ErrorAction Stop
+        if ($result.ReturnValue -ne 0) {
+            throw "ChangeStartMode returned code $($result.ReturnValue)."
+        }
+    }
+    if (-not $okDisable) { return }
+
+    $verify = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
+    if ($verify -and $verify.State -eq "Stopped" -and $verify.StartMode -eq "Disabled") {
+        Write-Good "Service '$name' is now STOPPED and DISABLED."
+    } else {
+        Write-Warn "Command completed, but verification was not fully confirmed. Re-check Services console."
+    }
+}
+
+function Services-SaveToLog {
+    Write-Section "Save Services List to Log"
+    $services = Services-GetAll
+    if (-not $services) { return }
+
+    Save-OutputToFile -FileName "Services_All.txt" -Command {
+        $services |
+            Select-Object `
+                @{n="Name";e={$_.Name}},
+                @{n="DisplayName";e={$_.DisplayName}},
+                @{n="State";e={$_.State}},
+                @{n="StartType";e={$_.StartMode}},
+                @{n="PathName";e={$_.PathName}} |
+            Sort-Object Name
+    }
+}
+
+function Services-Menu {
+    while ($true) {
+        Write-Section "Services"
+        Write-Host "1  List services (top 200)"
+        Write-Host "2  Search services"
+        Write-Host "3  Stop + Disable a service"
+        Write-Host "4  Save services list to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { Services-ListAll; Pause-PressEnter }
+            "2" { Services-Search; Pause-PressEnter }
+            "3" { Services-StopAndDisable; Pause-PressEnter }
+            "4" { Services-SaveToLog; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# LOGS / MONITORING MENU
+# ==============================================================================
+
+function Logs-ShowFolder {
+    Write-Section "Log Folder"
+    Write-Good $Global:SessionLogDir
+}
+
+function Logs-QuickEventView {
+    Write-Section "Event Logs Quick View"
+    $null = Invoke-Safe -FriendlyError "Could not read event logs." -Action {
+        Write-Info "System: last 20 warnings/errors"
+        Get-WinEvent -LogName System -MaxEvents 500 |
+            Where-Object { $_.LevelDisplayName -in @("Error","Warning") } |
+            Select-Object -First 20 TimeCreated,LevelDisplayName,ProviderName,Id,Message |
+            Format-Table -Wrap
+
+        Write-Host ""
+        Write-Info "Security: last 20 failed logons (4625) if available"
+        try {
+            Get-WinEvent -LogName Security -MaxEvents 2500 |
+                Where-Object { $_.Id -eq 4625 } |
+                Select-Object -First 20 TimeCreated,Id,Message |
+                Format-Table -Wrap
+        } catch {
+            Write-Warn "Could not read Security log (permissions/auditing may block it)."
+        }
+    }
+}
+
+function Logs-SaveQuick {
+    Write-Section "Save Quick Logs"
+    Save-OutputToFile -FileName "EventLog_System_ErrWarn.txt" -Command {
+        Get-WinEvent -LogName System -MaxEvents 1200 |
+            Where-Object { $_.LevelDisplayName -in @("Error","Warning") } |
+            Select-Object TimeCreated,LevelDisplayName,ProviderName,Id,Message
+    }
+
+    Save-OutputToFile -FileName "EventLog_Security_4625_FailedLogons.txt" -Command {
+        Get-WinEvent -LogName Security -MaxEvents 6000 |
+            Where-Object { $_.Id -eq 4625 } |
+            Select-Object TimeCreated,Id,Message
+    }
+}
+
+function Logs-Menu {
+    while ($true) {
+        Write-Section "Logs / Monitoring"
+        Write-Host "1  Show current session log folder"
+        Write-Host "2  Quick event log view"
+        Write-Host "3  Save quick logs to files"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { Logs-ShowFolder; Pause-PressEnter }
+            "2" { Logs-QuickEventView; Pause-PressEnter }
+            "3" { Logs-SaveQuick; Pause-PressEnter }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# SYSTEM ADMIN MENU
+# ==============================================================================
+
+function Sys-ShowSystemInfo {
+    Write-Section "System Info"
+    $null = Invoke-Safe -FriendlyError "Could not read system info." -Action {
+        $os = Get-CimInstance Win32_OperatingSystem
+        $cs = Get-CimInstance Win32_ComputerSystem
+        [pscustomobject]@{
+            ComputerName = $env:COMPUTERNAME
+            Domain       = $cs.Domain
+            OS           = $os.Caption
+            Version      = $os.Version
+            BuildNumber  = $os.BuildNumber
+            UptimeDays   = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 2)
+            RAM_GB       = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+        } | Format-List
+    }
+}
+
+function Sys-Disks {
+    Write-Section "Disk Usage"
+    $null = Invoke-Safe -FriendlyError "Could not read disk info." -Action {
+        Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+            Select-Object DeviceID,
+                          @{n="SizeGB";e={[math]::Round($_.Size/1GB,2)}},
+                          @{n="FreeGB";e={[math]::Round($_.FreeSpace/1GB,2)}},
+                          @{n="FreePercent";e={[math]::Round(($_.FreeSpace/$_.Size)*100,2)}} |
+            Format-Table -AutoSize
+    }
+}
+
+function Sys-InstalledRoles {
+    Write-Section "Installed Roles/Features"
+    $null = Invoke-Safe -FriendlyError "Could not read installed roles/features." -Action {
+        Get-WindowsFeature | Where-Object Installed -eq $true | Select-Object Name,DisplayName | Format-Table -AutoSize
+    }
+}
+
+function Sys-TopProcesses {
+    Write-Section "Top Processes by CPU (Top 15)"
+    $null = Invoke-Safe -FriendlyError "Could not read processes." -Action {
+        Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 Name,Id,CPU,WorkingSet | Format-Table -AutoSize
+    }
+}
+
+function SystemAdmin-Menu {
+    while ($true) {
+        Write-Section "System Admin"
+        Write-Host "1  System info + uptime"
+        Write-Host "2  Disk usage"
+        Write-Host "3  Installed roles/features"
+        Write-Host "4  Top processes (CPU)"
+        Write-Host "5  Save baseline to log"
+        Write-Host "0  Back"
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1" { Sys-ShowSystemInfo; Pause-PressEnter }
+            "2" { Sys-Disks; Pause-PressEnter }
+            "3" { Sys-InstalledRoles; Pause-PressEnter }
+            "4" { Sys-TopProcesses; Pause-PressEnter }
+            "5" {
+                Write-Section "Save Baseline"
+                Save-OutputToFile -FileName "Baseline_ComputerInfo.txt"      -Command { Get-ComputerInfo }
+                Save-OutputToFile -FileName "Baseline_ListeningPorts.txt"    -Command { Get-NetTCPConnection -State Listen | Sort-Object LocalPort }
+                Save-OutputToFile -FileName "Baseline_FirewallProfiles.txt"  -Command { Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction }
+                Save-OutputToFile -FileName "Baseline_InstalledRoles.txt"    -Command { Get-WindowsFeature | Where-Object Installed -eq $true | Select-Object Name,DisplayName }
+                Write-Good "Baseline saved."
+                Pause-PressEnter
+            }
+            "0" { return }
+            default { Show-UserError "Invalid choice."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# MAIN MENU (17 TOP LEVEL OPTIONS)
+# ==============================================================================
+
+function Main-Menu {
+    while ($true) {
+        Clear-Host
+        Write-Host $Global:ToolkitName -ForegroundColor Cyan
+        Write-Host ("Session logs: {0}" -f $Global:SessionLogDir) -ForegroundColor DarkGray
+        Write-Host ""
+
+        Write-Host "1   Network"
+        Write-Host "2   Local Users"
+        Write-Host "3   AD Users"
+        Write-Host "4   AD Computers"
+        Write-Host "5   AD Policies (Password policy + FGPP)"
+        Write-Host "6   GPO Quick View"
+        Write-Host "7   DNS"
+        Write-Host "8   DHCP"
+        Write-Host "9   Firewall"
+        Write-Host "10  Zero Trust"
+        Write-Host "11  Allow-List Wizard (after Zero Trust)"
+        Write-Host "12  WinRM"
+        Write-Host "13  SMB Hardening"
+        Write-Host "14  Quick Scans"
+        Write-Host "15  Services"
+        Write-Host "16  Logs / Monitoring"
+        Write-Host "17  System Admin"
+        Write-Host "0   Exit"
+        Write-Host ""
+
+        $c = Read-Choice "Choose"
+        switch ($c) {
+            "1"  { Network-Menu }
+            "2"  { LocalUsers-Menu }
+            "3"  { ADUsers-Menu }
+            "4"  { ADComputers-Menu }
+            "5"  { ADPolicies-Menu }
+            "6"  { GPO-Menu }
+            "7"  { DNS-Menu }
+            "8"  { DHCP-Menu }
+            "9"  { Firewall-Menu }
+            "10" { ZeroTrust-Menu }
+            "11" { AllowList-Menu }
+            "12" { WinRM-Menu }
+            "13" { SMB-Menu }
+            "14" { Scans-Menu }
+            "15" { Services-Menu }
+            "16" { Logs-Menu }
+            "17" { SystemAdmin-Menu }
+            "0"  { return }
+            default { Show-UserError "Invalid choice. Pick a menu number."; Pause-PressEnter }
+        }
+    }
+}
+
+# ==============================================================================
+# SCRIPT START / STOP
+# ==============================================================================
+
+Ensure-Admin
+Ensure-LogFolders
+Start-ToolkitTranscript
+
+try {
+    Main-Menu
+}
+finally {
+    Stop-ToolkitTranscript
+    Write-Host ""
+    Write-Good "Done. Logs saved in: $Global:SessionLogDir"
+}
