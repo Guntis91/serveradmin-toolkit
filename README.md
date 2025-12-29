@@ -1,55 +1,61 @@
-\# ServerAdmin Toolkit (Windows Server 2022)
+# ServerAdmin Toolkit (Windows Server 2022)
 
+A menu-driven PowerShell toolkit designed to help system administrators perform common Windows Server tasks quickly, safely, and consistently from a single interface.
 
+This tool was built for learning, lab environments, and portfolio demonstration, following real-world sysadmin workflows.
 
-Menu-driven PowerShell toolkit for common sysadmin tasks:
+---
 
-\- Network diagnostics + listening ports
+## Features
 
-\- Local users + local password policy
+The toolkit provides fast access to common administrative tasks without manually searching through Windows menus or consoles.
 
-\- Active Directory users + computers
+### User and Computer Management
+- List local users
+- Add and remove local users
+- Local password policy checks
+- Active Directory user management (if AD module is available)
+- Active Directory computer management
+- Disable or move computer accounts to OUs
 
-\- AD password policy + FGPP
+### Network and Security
+- View network configuration and active connections
+- Scan for open TCP ports
+- Zero Trust mode (block all inbound firewall rules with confirmation)
+- Allow-list wizard for essential services after Zero Trust
+- Firewall rule enable, disable, backup, and restore
+- SMB hardening checks (SMBv1, signing, NTLM settings)
+- WinRM enable, disable, and TrustedHosts management
 
-\- GPO quick view (GPMC required)
+### Services and System
+- List Windows services using reliable CIM queries
+- Search services by name or display name
+- Stop and disable unwanted or risky services
+- Clear status reporting with verification
 
-\- DNS management (DNS role/RSAT)
+### Group Policy
+- List all Group Policy Objects
+- Search GPOs by name
+- View direct and inherited GPO links for an OU or domain
+- Save GPO information to logs
 
-\- DHCP management (DHCP role/RSAT)
+### DNS and DHCP
+- DNS zone and record checks (if DNS role is installed)
+- DHCP scope and lease inspection (if DHCP role is installed)
+- Input validation to prevent incorrect commands
 
-\- Firewall management + backup/restore
+### Logging and Reporting
+- All actions and outputs are logged
+- Logs are saved per session with timestamps
+- Easy to export data for reports or audits
 
-\- Zero Trust “block all” + allow-list wizard
+---
 
-\- WinRM enable/disable + TrustedHosts
+## How to Run
 
-\- SMB hardening checks
+1. Open **PowerShell as Administrator**
+2. Navigate to the project folder:
+   ```powershell
+   cd D:\Github\serveradmin-toolkit
 
-\- Quick TCP port scanning
-
-\- Services management (CIM-based)
-
-\- Logs/monitoring + exports
-
-\- Baseline export reports
-
-
-
-\## Run
-
-Open PowerShell as Administrator:
-
-
-
-```powershell
-
-Set-ExecutionPolicy -Scope Process Bypass -Force
-
-.\\ServerAdmin-Toolkit.ps1
-
-Logs
-
-Logs are saved to:
-C:\AdminToolkit\Logs\<timestamp>\
 
